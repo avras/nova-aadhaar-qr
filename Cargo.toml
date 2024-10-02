@@ -1,0 +1,28 @@
+[package]
+name = "nova-aadhaar-qr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bellpepper = { version = "0.4.0", default-features = false }
+bellpepper-core = { version = "0.4.0", default-features = false }
+bellpepper-nonnative = { git = "https://github.com/avras/bellperson-nonnative.git" }
+ff = "0.13.0"
+nova-snark = { version = "0.33.0", default-features = false, git = "https://github.com/varunthakore/Nova.git" }
+sha2 = { version = "0.10.8", default-features = false, features = ["compress"] }
+pasta_curves = { version = "0.5.1", default-features = false }
+generic-array = "1.0.0"
+hex = "0.4.3"
+num-bigint = "0.4.4"
+neptune = { version = "13.0.0", default-features = false }
+
+[[example]]
+name = "proveage"
+
+[dev-dependencies]
+clap = "4.5.4"
+image = "0.25.2"
+rqrr = "0.7.1"
+zlib-rs = "0.3.0"
+bincode = "1.3.3"
+flate2 = "1.0.34"

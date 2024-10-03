@@ -33,19 +33,16 @@ fn main() {
         .after_help("The proveage command proves that the Aadhaar holder is 18+");
 
     let m = cmd.get_matches();
-    let aadhaar_qrcode_image_filename = m.get_one::<String>("aadhaar_qrcode_image").unwrap();
+    let fname = m.get_one::<String>("aadhaar_qrcode_image").unwrap();
 
-    let img = image::open(aadhaar_qrcode_image_filename)
-        .unwrap()
-        .to_luma8();
+    let img = image::open(fname).unwrap().to_luma8();
     // Prepare for detection
     let mut img = rqrr::PreparedImage::prepare(img);
     // Search for grids, without decoding
     let grids = img.detect_grids();
     assert_eq!(grids.len(), 1);
     // Decode the grid
-    let (meta, content) = grids[0].decode().unwrap();
-    assert_eq!(meta.ecc_level, 0);
+    let (_, content) = grids[0].decode().unwrap();
 
     let content_bytes = content.as_bytes();
     let qr_int = BigInt::parse_bytes(content_bytes, 10).unwrap();
@@ -55,6 +52,7 @@ fn main() {
     let config = InflateConfig { window_bits: 31 };
     let (decompressed_qr_bytes, ret) = uncompress_slice(&mut output, &qr_int_bytes, config);
     assert_eq!(ret, ReturnCode::Ok);
+    // println!("{:?}", String::from_utf8_lossy(decompressed_qr_bytes));
 
     type E1 = PallasEngine;
     type E2 = VestaEngine;

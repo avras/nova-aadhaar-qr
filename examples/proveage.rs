@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use bellpepper::gadgets::multipack::{bytes_to_bits, compute_multipacking};
 use clap::Command;
 use flate2::{write::ZlibEncoder, Compression};
 use image::{self};
@@ -30,10 +31,17 @@ fn main() {
                 .value_name("Aadhaar QR code image file")
                 .required(true),
         )
+        .arg(
+            clap::Arg::new("current_date")
+                .value_name("Current date in DD-MM-YYYY format")
+                .required(true),
+        )
         .after_help("The proveage command proves that the Aadhaar holder is 18+");
 
     let m = cmd.get_matches();
     let fname = m.get_one::<String>("aadhaar_qrcode_image").unwrap();
+    let current_date_str = m.get_one::<String>("current_date").unwrap();
+    let current_date_bytes: &[u8; 10] = current_date_str.as_bytes().try_into().unwrap();
 
     let img = image::open(fname).unwrap().to_luma8();
     // Prepare for detection
@@ -101,8 +109,7 @@ fn main() {
     }
     let aadhaar_qr_data = res.unwrap();
 
-    let current_date_bytes = b"05-10-2024";
-    let primary_circuit_sequence = C1::new_state_sequence(&aadhaar_qr_data, *current_date_bytes);
+    let primary_circuit_sequence = C1::new_state_sequence(&aadhaar_qr_data);
 
     let sha256_iv = sha256_initial_digest_scalars::<<E1 as Engine>::Scalar>();
     let initial_opcode = <E1 as Engine>::Scalar::from(OP_SHA256_FIRST);
@@ -113,12 +120,13 @@ fn main() {
     initial_io_values.extend_from_slice(&[<E1 as Engine>::Scalar::zero(); BIGNAT_NUM_LIMBS]);
     let initial_io_hash = aadhaar_io_hasher.hash(&initial_io_values);
 
-    // The last scalar corresponds to the RSA signature hash, that is initially set to zero.
-    let z0_primary = vec![
-        initial_opcode,
-        initial_io_hash,
-        <E1 as Engine>::Scalar::zero(),
-    ];
+    let current_date_bits = bytes_to_bits(current_date_bytes);
+    let current_date_scalars = compute_multipacking::<<E1 as Engine>::Scalar>(&current_date_bits);
+    assert_eq!(current_date_scalars.len(), 1);
+    let current_date_scalar = current_date_scalars[0];
+
+    // The last scalar corresponds to the current date
+    let z0_primary = vec![initial_opcode, initial_io_hash, current_date_scalar];
 
     let z0_secondary = vec![<E2 as Engine>::Scalar::zero()];
 

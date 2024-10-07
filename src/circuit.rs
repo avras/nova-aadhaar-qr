@@ -50,7 +50,6 @@ where
     next_opcode: Scalar,
     num_sha256_msg_blocks_even: bool,
     dob_byte_index: usize,
-    current_date_bytes: [u8; DATE_LENGTH_BYTES], // Format is DD-MM-YYYY
     sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
     current_sha256_digest_bytes: [u8; SHA256_DIGEST_LENGTH_BYTES],
     rsa_sig: [u8; RSA_MODULUS_LENGTH_BYTES],
@@ -66,7 +65,6 @@ where
             next_opcode: Scalar::ZERO,
             num_sha256_msg_blocks_even: false,
             dob_byte_index: 0,
-            current_date_bytes: [0u8; DATE_LENGTH_BYTES],
             sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
             current_sha256_digest_bytes: [0u8; SHA256_DIGEST_LENGTH_BYTES],
             rsa_sig: [0u8; RSA_MODULUS_LENGTH_BYTES],
@@ -81,7 +79,6 @@ where
 {
     pub fn new_state_sequence(
         aadhaar_qr_data: &AadhaarQRData,
-        current_date_bytes: [u8; DATE_LENGTH_BYTES],
     ) -> Vec<AadhaarAgeProofCircuit<Scalar>> {
         let mut sha256_msg_blocks = sha256_msg_block_sequence(aadhaar_qr_data.signed_data.clone());
         let num_sha256_msg_blocks_even = sha256_msg_blocks.len() % 2 == 0;
@@ -100,7 +97,6 @@ where
                 next_opcode: other_sha256_opcode,
                 num_sha256_msg_blocks_even,
                 dob_byte_index: aadhaar_qr_data.dob_byte_index,
-                current_date_bytes,
                 sha256_msg_block_pair: [sha256_msg_blocks[2 * i], sha256_msg_blocks[2 * i + 1]]
                     .concat()
                     .try_into()
@@ -127,7 +123,6 @@ where
             next_opcode: first_rsa_opcode, // first RSA opcode
             num_sha256_msg_blocks_even,
             dob_byte_index: aadhaar_qr_data.dob_byte_index,
-            current_date_bytes,
             sha256_msg_block_pair: [
                 sha256_msg_blocks[sha256_msg_blocks.len() - 2],
                 sha256_msg_blocks[sha256_msg_blocks.len() - 1],
@@ -173,7 +168,6 @@ where
                 next_opcode,
                 num_sha256_msg_blocks_even,
                 dob_byte_index: aadhaar_qr_data.dob_byte_index,
-                current_date_bytes,
                 sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
                 current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state)
                     .try_into()
@@ -391,19 +385,9 @@ where
             &is_opcode_first_sha256,
         )?;
 
-        let current_date_bits = bytes_to_bits(&self.current_date_bytes)
-            .into_iter()
-            .enumerate()
-            .map(|(i, b)| {
-                Boolean::from(
-                    AllocatedBit::alloc(
-                        cs.namespace(|| format!("alloc current date bit {i}")),
-                        Some(b),
-                    )
-                    .unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut current_date_bits = z[2].to_bits_le(cs.namespace(|| "alloc current date bits"))?;
+        current_date_bits.truncate(DATE_LENGTH_BYTES * 8);
+
         let (current_day, current_month, current_year) = get_day_month_year_conditional(
             cs.namespace(|| "get current birth day, month, year"),
             &current_date_bits,
@@ -482,7 +466,7 @@ where
         let prev_rsa_sig_hash = &z[2];
         let rsa_signature_bigint = BigInt::from_bytes_be(Sign::Plus, &self.rsa_sig);
         let rsa_signature = BigNat::<Scalar>::alloc_from_nat(
-            cs.namespace(|| "alloc RSA modulus"),
+            cs.namespace(|| "alloc RSA signature"),
             || Ok(rsa_signature_bigint),
             BIGNAT_LIMB_WIDTH,
             BIGNAT_NUM_LIMBS,

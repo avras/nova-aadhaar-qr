@@ -271,20 +271,23 @@ where
     CS: ConstraintSystem<Scalar>,
 {
     // will work for year < 4096
-    range_check_num(
+    range_check_num_conditional(
         cs.namespace(|| "check current year fits in 12 bits"),
         current_year,
         12,
+        condition,
     )?;
-    range_check_num(
+    range_check_num_conditional(
         cs.namespace(|| "check current month fits in 4 bits"),
         current_month,
         4,
+        condition,
     )?;
-    range_check_num(
+    range_check_num_conditional(
         cs.namespace(|| "check current day fits in 5 bits"),
         current_day,
         5,
+        condition,
     )?;
 
     let year_diff = AllocatedNum::alloc(cs.namespace(|| "alloc year diff"), || {
@@ -605,6 +608,6 @@ mod test {
             println!("{:?}", cs.which_is_unsatisfied());
         }
         assert!(cs.is_satisfied());
-        assert_eq!(cs.num_constraints(), 804);
+        assert_eq!(cs.num_constraints(), 807);
     }
 }

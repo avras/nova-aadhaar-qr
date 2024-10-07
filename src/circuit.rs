@@ -14,6 +14,10 @@ use num_bigint::{BigInt, Sign};
 use sha2::{compress256, digest::generic_array::GenericArray};
 
 use crate::{
+    dob::{
+        calculate_age_in_years, delimiter_count_before_dob_is_correct,
+        get_day_month_year_conditional, left_shift_bytes, DOB_INDEX_BIT_LENGTH,
+    },
     poseidon::{AadhaarIOHasher, RSASigHasher},
     qr::AadhaarQRData,
     rsa::{
@@ -25,14 +29,18 @@ use crate::{
         SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
     },
     util::{
-        alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs, boolean_implies,
-        conditionally_select_boolean_vec, conditionally_select_vec,
+        alloc_constant, alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs,
+        boolean_implies, conditionally_select_boolean_vec, conditionally_select_vec,
+        less_than_or_equal,
     },
 };
 
-pub const OP_SHA256: u64 = 0u64;
-pub const OP_RSA_FIRST: u64 = 1u64;
-pub const OP_RSA_LAST: u64 = 17u64;
+pub const OP_SHA256_FIRST: u64 = 0u64;
+pub const OP_SHA256_OTHER: u64 = 1u64;
+pub const OP_RSA_FIRST: u64 = 2u64;
+pub const OP_RSA_LAST: u64 = 18u64;
+
+const DATE_LENGTH_BYTES: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct AadhaarAgeProofCircuit<Scalar>
@@ -41,6 +49,8 @@ where
 {
     next_opcode: Scalar,
     num_sha256_msg_blocks_even: bool,
+    dob_byte_index: usize,
+    current_date_bytes: [u8; DATE_LENGTH_BYTES], // Format is DD-MM-YYYY
     sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
     current_sha256_digest_bytes: [u8; SHA256_DIGEST_LENGTH_BYTES],
     rsa_sig: [u8; RSA_MODULUS_LENGTH_BYTES],
@@ -55,6 +65,8 @@ where
         Self {
             next_opcode: Scalar::ZERO,
             num_sha256_msg_blocks_even: false,
+            dob_byte_index: 0,
+            current_date_bytes: [0u8; DATE_LENGTH_BYTES],
             sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
             current_sha256_digest_bytes: [0u8; SHA256_DIGEST_LENGTH_BYTES],
             rsa_sig: [0u8; RSA_MODULUS_LENGTH_BYTES],
@@ -69,6 +81,7 @@ where
 {
     pub fn new_state_sequence(
         aadhaar_qr_data: &AadhaarQRData,
+        current_date_bytes: [u8; DATE_LENGTH_BYTES],
     ) -> Vec<AadhaarAgeProofCircuit<Scalar>> {
         let mut sha256_msg_blocks = sha256_msg_block_sequence(aadhaar_qr_data.signed_data.clone());
         let num_sha256_msg_blocks_even = sha256_msg_blocks.len() % 2 == 0;
@@ -78,14 +91,16 @@ where
         }
 
         let mut aadhaar_steps = vec![];
-        let sha256_opcode = Scalar::from(OP_SHA256);
+        let other_sha256_opcode = Scalar::from(OP_SHA256_OTHER);
 
         let mut sha256_state = SHA256_IV;
 
         for i in 0..(sha256_msg_blocks.len() / 2) - 1 {
             aadhaar_steps.push(Self {
-                next_opcode: sha256_opcode,
+                next_opcode: other_sha256_opcode,
                 num_sha256_msg_blocks_even,
+                dob_byte_index: aadhaar_qr_data.dob_byte_index,
+                current_date_bytes,
                 sha256_msg_block_pair: [sha256_msg_blocks[2 * i], sha256_msg_blocks[2 * i + 1]]
                     .concat()
                     .try_into()
@@ -111,6 +126,8 @@ where
         aadhaar_steps.push(Self {
             next_opcode: first_rsa_opcode, // first RSA opcode
             num_sha256_msg_blocks_even,
+            dob_byte_index: aadhaar_qr_data.dob_byte_index,
+            current_date_bytes,
             sha256_msg_block_pair: [
                 sha256_msg_blocks[sha256_msg_blocks.len() - 2],
                 sha256_msg_blocks[sha256_msg_blocks.len() - 1],
@@ -155,6 +172,8 @@ where
             let rsa_step = Self {
                 next_opcode,
                 num_sha256_msg_blocks_even,
+                dob_byte_index: aadhaar_qr_data.dob_byte_index,
+                current_date_bytes,
                 sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
                 current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state)
                     .try_into()
@@ -207,15 +226,26 @@ where
             &next_opcode,
         )?;
 
-        let is_opcode_sha256 = alloc_num_equals_constant(
-            cs.namespace(|| "SHA256 flag"),
+        let is_opcode_first_sha256 = alloc_num_equals_constant(
+            cs.namespace(|| "first SHA256 opcode flag"),
             opcode,
-            Scalar::from(OP_SHA256),
+            Scalar::from(OP_SHA256_FIRST),
+        )?;
+        let is_opcode_other_sha256 = alloc_num_equals_constant(
+            cs.namespace(|| "SHA256 opcode other than the first flag"),
+            opcode,
+            Scalar::from(OP_SHA256_OTHER),
         )?;
         let is_opcode_last_sha256 = Boolean::and(
             cs.namespace(|| "last SHA256 opcode flag"),
-            &is_opcode_sha256,
+            &is_opcode_other_sha256,
             &is_next_opcode_equal_to_opcode.not(),
+        )?;
+
+        let is_opcode_sha256 = Boolean::or(
+            cs.namespace(|| "first or other SHA256"),
+            &is_opcode_first_sha256,
+            &is_opcode_other_sha256,
         )?;
 
         let is_opcode_rsa = is_opcode_sha256.not();
@@ -230,10 +260,21 @@ where
             Scalar::from(OP_RSA_LAST),
         )?;
 
+        let mut should_next_opcode_be_one_more = Boolean::or(
+            cs.namespace(|| "first SHA256 OR last SHA256"),
+            &is_opcode_first_sha256,
+            &is_opcode_last_sha256,
+        )?;
+        should_next_opcode_be_one_more = Boolean::or(
+            cs.namespace(|| "first SHA256 OR last SHA256 OR RSA"),
+            &should_next_opcode_be_one_more,
+            &is_opcode_rsa,
+        )?;
+
         // if opcode is RSA, next opcode should be 1 more
         boolean_implies(
             cs.namespace(|| "if opcode is RSA, then next opcode is incremented"),
-            &is_opcode_rsa,
+            &should_next_opcode_be_one_more,
             &is_next_opcode_equal_to_opcode.not(),
         )?;
 
@@ -266,7 +307,7 @@ where
 
         let aadhaar_io_hasher = AadhaarIOHasher::<Scalar>::new(2 + BIGNAT_NUM_LIMBS as u32);
         let mut io_hash_preimage = current_sha256_digest_scalars.clone();
-        io_hash_preimage.extend(rsa_sig_power_allocatednum_limbs.clone());
+        io_hash_preimage.extend(rsa_sig_power_allocatednum_limbs.clone().into_iter());
         let calc_io_hash = aadhaar_io_hasher.hash_in_circuit(
             &mut cs.namespace(|| "hash non-deterministic inputs"),
             &io_hash_preimage,
@@ -315,6 +356,82 @@ where
                 )
             })
             .collect();
+
+        let dob_byte_index =
+            AllocatedNum::alloc_infallible(cs.namespace(|| "alloc DoB byte index"), || {
+                Scalar::from(self.dob_byte_index as u64)
+            });
+
+        let mut two_sha256_msg_blocks = first_sha256_msg_block_booleans.clone();
+        two_sha256_msg_blocks.extend(second_sha256_msg_block_booleans.clone().into_iter());
+
+        let delimiter_count_correct = delimiter_count_before_dob_is_correct(
+            cs.namespace(|| "check if delimiter count before DoB is correct"),
+            &two_sha256_msg_blocks,
+            &dob_byte_index,
+        )?;
+        boolean_implies(
+            cs.namespace(|| "if first SHA256 step then delimiter count must be correct"),
+            &is_opcode_first_sha256,
+            &delimiter_count_correct,
+        )?;
+
+        let mut shift_bits =
+            dob_byte_index.to_bits_le(cs.namespace(|| "decompose DoB byte index"))?;
+        shift_bits.truncate(DOB_INDEX_BIT_LENGTH);
+
+        let shifted_msg_blocks = left_shift_bytes(
+            cs.namespace(|| "left shift to bring DoB bytes to the beginning"),
+            &two_sha256_msg_blocks,
+            &shift_bits,
+        )?;
+        let (day, month, year) = get_day_month_year_conditional(
+            cs.namespace(|| "get birth day, month, year"),
+            &shifted_msg_blocks[0..DATE_LENGTH_BYTES * 8],
+            &is_opcode_first_sha256,
+        )?;
+
+        let current_date_bits = bytes_to_bits(&self.current_date_bytes)
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| {
+                Boolean::from(
+                    AllocatedBit::alloc(
+                        cs.namespace(|| format!("alloc current date bit {i}")),
+                        Some(b),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (current_day, current_month, current_year) = get_day_month_year_conditional(
+            cs.namespace(|| "get current birth day, month, year"),
+            &current_date_bits,
+            &is_opcode_first_sha256,
+        )?;
+
+        let age = calculate_age_in_years(
+            cs.namespace(|| "calculate age"),
+            &day,
+            &month,
+            &year,
+            &current_day,
+            &current_month,
+            &current_year,
+            &is_opcode_first_sha256,
+        )?;
+        let age18 = alloc_constant(cs.namespace(|| "alloc 18"), Scalar::from(18u64))?;
+        let age_gte_18 = less_than_or_equal(
+            cs.namespace(|| "age <= 18"),
+            &age18,
+            &age,
+            19, // In the first step, age will occupy 7 bits but in later steps it can occupy 19 bits
+        )?;
+        boolean_implies(
+            cs.namespace(|| "if first SHA256 step then age must at least 18"),
+            &is_opcode_first_sha256,
+            &age_gte_18,
+        )?;
 
         let first_sha256_io = super::sha256::compress(
             &mut cs.namespace(|| "Compress first SHA256 message block"),
@@ -484,14 +601,14 @@ where
         )?;
 
         let mut io_allocatednums = next_sha256_digest_scalars.clone();
-        io_allocatednums.extend(next_rsa_sig_power_allocatednum_limbs);
+        io_allocatednums.extend(next_rsa_sig_power_allocatednum_limbs.into_iter());
 
         let new_io_hash = aadhaar_io_hasher
             .hash_in_circuit(&mut cs.namespace(|| "hash IO"), &io_allocatednums)?;
 
         // Pack the final SHA256 hash in two scalars for debugging. TODO: Fix this
         let mut last_z_out = vec![next_opcode.clone()];
-        last_z_out.extend(next_sha256_digest_scalars);
+        last_z_out.extend(next_sha256_digest_scalars.into_iter());
 
         let z_out = conditionally_select_vec(
             cs.namespace(|| "Choose between current and next SHA256 masked digests"),

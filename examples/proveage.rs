@@ -4,7 +4,7 @@ use clap::Command;
 use flate2::{write::ZlibEncoder, Compression};
 use image::{self};
 use nova_aadhaar_qr::{
-    circuit::{AadhaarAgeProofCircuit, OP_RSA_LAST, OP_SHA256},
+    circuit::{AadhaarAgeProofCircuit, OP_RSA_LAST, OP_SHA256_FIRST},
     poseidon::AadhaarIOHasher,
     qr::parse_aadhaar_qr_data,
     rsa::BIGNAT_NUM_LIMBS,
@@ -101,10 +101,11 @@ fn main() {
     }
     let aadhaar_qr_data = res.unwrap();
 
-    let primary_circuit_sequence = C1::new_state_sequence(&aadhaar_qr_data);
+    let current_date_bytes = b"05-10-2024";
+    let primary_circuit_sequence = C1::new_state_sequence(&aadhaar_qr_data, *current_date_bytes);
 
     let sha256_iv = sha256_initial_digest_scalars::<<E1 as Engine>::Scalar>();
-    let initial_opcode = <E1 as Engine>::Scalar::from(OP_SHA256);
+    let initial_opcode = <E1 as Engine>::Scalar::from(OP_SHA256_FIRST);
 
     let aadhaar_io_hasher =
         AadhaarIOHasher::<<E1 as Engine>::Scalar>::new(2 + BIGNAT_NUM_LIMBS as u32);

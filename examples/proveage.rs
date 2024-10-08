@@ -14,7 +14,7 @@ use nova_aadhaar_qr::{
 use nova_snark::{
     provider::{PallasEngine, VestaEngine},
     traits::{circuit::TrivialCircuit, snark::RelaxedR1CSSNARKTrait, Engine},
-    CompressedSNARK, PublicParams, RecursiveSNARK,
+    CompressedSNARK, PublicParams, RecursiveSNARK, FINAL_EXTERNAL_COUNTER,
 };
 use num_bigint::BigInt;
 use zlib_rs::{
@@ -70,7 +70,7 @@ fn main() {
     type C1 = AadhaarAgeProofCircuit<<E1 as Engine>::Scalar>;
     type C2 = TrivialCircuit<<E2 as Engine>::Scalar>;
     let circuit_primary: C1 = AadhaarAgeProofCircuit::default();
-    let circuit_secondary: C2 = TrivialCircuit::default();
+    let circuit_secondary: C2 = TrivialCircuit::new(nova_snark::StepCounterType::External);
 
     let param_gen_timer = Instant::now();
     println!("Producing public parameters...");
@@ -163,8 +163,7 @@ fn main() {
     // verify the recursive SNARK
     println!("Verifying a RecursiveSNARK...");
     let start = Instant::now();
-    let num_steps = primary_circuit_sequence.len();
-    let res = recursive_snark.verify(&pp, num_steps, &z0_primary, &z0_secondary);
+    let res = recursive_snark.verify(&pp, FINAL_EXTERNAL_COUNTER, &z0_primary, &z0_secondary);
     println!(
         "RecursiveSNARK::verify: {:?}, took {:?}",
         res.is_ok(),
@@ -202,7 +201,7 @@ fn main() {
     // verify the compressed SNARK
     println!("Verifying a CompressedSNARK...");
     let start = Instant::now();
-    let res = compressed_snark.verify(&vk, num_steps, &z0_primary, &z0_secondary);
+    let res = compressed_snark.verify(&vk, FINAL_EXTERNAL_COUNTER, &z0_primary, &z0_secondary);
     let verification_time = start.elapsed();
     println!(
         "CompressedSNARK::verify: {:?}, took {:?}",

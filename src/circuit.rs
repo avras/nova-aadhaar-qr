@@ -1,4 +1,4 @@
-use bellpepper::gadgets::multipack::bytes_to_bits;
+use bellpepper::gadgets::multipack::{bytes_to_bits, compute_multipacking, pack_bits};
 use bellpepper_core::{
     boolean::{AllocatedBit, Boolean},
     num::AllocatedNum,
@@ -18,7 +18,7 @@ use crate::{
         calculate_age_in_years, delimiter_count_before_dob_is_correct,
         get_day_month_year_conditional, left_shift_bytes, DOB_INDEX_BIT_LENGTH,
     },
-    poseidon::{AadhaarIOHasher, RSASigHasher},
+    poseidon::PoseidonHasher,
     qr::AadhaarQRData,
     rsa::{
         emsa_pkcs1v15_encode, BIGNAT_LIMB_WIDTH, BIGNAT_NUM_LIMBS, RSA_MODULUS_HEX_BYTES,
@@ -30,8 +30,8 @@ use crate::{
     },
     util::{
         alloc_constant, alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs,
-        boolean_implies, conditionally_select_boolean_vec, conditionally_select_vec,
-        less_than_or_equal,
+        boolean_implies, conditionally_select, conditionally_select_boolean_vec,
+        conditionally_select_vec, less_than_or_equal,
     },
 };
 
@@ -41,6 +41,8 @@ pub const OP_RSA_FIRST: u64 = 2u64;
 pub const OP_RSA_LAST: u64 = 18u64;
 
 const DATE_LENGTH_BYTES: usize = 10;
+const TIMESTAMP_START_BYTE_INDEX: usize = 9;
+const NAME_START_BYTE_INDEX: usize = 27;
 
 #[derive(Clone, Debug)]
 pub struct AadhaarAgeProofCircuit<Scalar>
@@ -53,6 +55,7 @@ where
     sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
     current_sha256_digest_bytes: [u8; SHA256_DIGEST_LENGTH_BYTES],
     rsa_sig: [u8; RSA_MODULUS_LENGTH_BYTES],
+    prev_nullifier: Scalar,
     rsa_sig_power: [Scalar; BIGNAT_NUM_LIMBS],
 }
 
@@ -67,6 +70,7 @@ where
             dob_byte_index: 0,
             sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
             current_sha256_digest_bytes: [0u8; SHA256_DIGEST_LENGTH_BYTES],
+            prev_nullifier: Scalar::ZERO,
             rsa_sig: [0u8; RSA_MODULUS_LENGTH_BYTES],
             rsa_sig_power: [Scalar::ZERO; BIGNAT_NUM_LIMBS],
         }
@@ -77,6 +81,17 @@ impl<Scalar> AadhaarAgeProofCircuit<Scalar>
 where
     Scalar: PrimeFieldBits,
 {
+    fn update_nullifier(prev_nullifier: Scalar, current_msg_blocks: &[u8]) -> Scalar {
+        assert_eq!(current_msg_blocks.len(), 2 * SHA256_BLOCK_LENGTH_BYTES);
+
+        let msg_blocks_bits = bytes_to_bits(current_msg_blocks);
+        let mut msg_blocks_scalars = compute_multipacking::<Scalar>(&msg_blocks_bits);
+        msg_blocks_scalars.insert(0, prev_nullifier);
+        let nullifier_hasher = PoseidonHasher::new(msg_blocks_scalars.len() as u32);
+        let next_nullifier = nullifier_hasher.hash(&msg_blocks_scalars);
+        next_nullifier
+    }
+
     pub fn new_state_sequence(
         aadhaar_qr_data: &AadhaarQRData,
     ) -> Vec<AadhaarAgeProofCircuit<Scalar>> {
@@ -91,19 +106,23 @@ where
         let other_sha256_opcode = Scalar::from(OP_SHA256_OTHER);
 
         let mut sha256_state = SHA256_IV;
+        let mut prev_nullifier = Scalar::ZERO;
 
         for i in 0..(sha256_msg_blocks.len() / 2) - 1 {
+            let sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] =
+                [sha256_msg_blocks[2 * i], sha256_msg_blocks[2 * i + 1]]
+                    .concat()
+                    .try_into()
+                    .unwrap();
             aadhaar_steps.push(Self {
                 next_opcode: other_sha256_opcode,
                 num_sha256_msg_blocks_even,
                 dob_byte_index: aadhaar_qr_data.dob_byte_index,
-                sha256_msg_block_pair: [sha256_msg_blocks[2 * i], sha256_msg_blocks[2 * i + 1]]
-                    .concat()
-                    .try_into()
-                    .unwrap(),
+                sha256_msg_block_pair,
                 current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state)
                     .try_into()
                     .unwrap(),
+                prev_nullifier,
                 rsa_sig: [0u8; RSA_MODULUS_LENGTH_BYTES],
                 rsa_sig_power: [Scalar::ZERO; BIGNAT_NUM_LIMBS],
             });
@@ -115,25 +134,42 @@ where
                 &mut sha256_state,
                 &[*GenericArray::from_slice(&sha256_msg_blocks[2 * i + 1])],
             );
+
+            let msg_blocks_without_timestamp: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] = if i == 0 {
+                [
+                    &sha256_msg_block_pair[0..TIMESTAMP_START_BYTE_INDEX],
+                    &[0u8; NAME_START_BYTE_INDEX - TIMESTAMP_START_BYTE_INDEX],
+                    &sha256_msg_block_pair[NAME_START_BYTE_INDEX..],
+                ]
+                .concat()
+                .try_into()
+                .unwrap()
+            } else {
+                sha256_msg_block_pair
+            };
+            prev_nullifier = Self::update_nullifier(prev_nullifier, &msg_blocks_without_timestamp);
         }
 
         let first_rsa_opcode = Scalar::from(OP_RSA_FIRST);
+        let sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] = [
+            sha256_msg_blocks[sha256_msg_blocks.len() - 2],
+            sha256_msg_blocks[sha256_msg_blocks.len() - 1],
+        ]
+        .concat()
+        .try_into()
+        .unwrap();
         // Last SHA256 step
         aadhaar_steps.push(Self {
             next_opcode: first_rsa_opcode, // first RSA opcode
             num_sha256_msg_blocks_even,
             dob_byte_index: aadhaar_qr_data.dob_byte_index,
-            sha256_msg_block_pair: [
-                sha256_msg_blocks[sha256_msg_blocks.len() - 2],
-                sha256_msg_blocks[sha256_msg_blocks.len() - 1],
-            ]
-            .concat()
-            .try_into()
-            .unwrap(),
+            sha256_msg_block_pair,
             current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state).try_into().unwrap(),
+            prev_nullifier,
             rsa_sig: aadhaar_qr_data.rsa_signature.clone().try_into().unwrap(),
             rsa_sig_power: [Scalar::ZERO; BIGNAT_NUM_LIMBS],
         });
+        let final_nullifier = Self::update_nullifier(prev_nullifier, &sha256_msg_block_pair);
 
         compress256(
             &mut sha256_state,
@@ -172,6 +208,7 @@ where
                 current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state)
                     .try_into()
                     .unwrap(),
+                prev_nullifier: final_nullifier,
                 rsa_sig: aadhaar_qr_data.rsa_signature.clone().try_into().unwrap(),
                 rsa_sig_power: rsa_sig_power_scalars,
             };
@@ -287,6 +324,10 @@ where
                 )
             })
             .collect::<Result<Vec<_>, SynthesisError>>()?;
+        let prev_nullifier =
+            AllocatedNum::alloc_infallible(cs.namespace(|| "alloc previous nullifier"), || {
+                self.prev_nullifier
+            });
         let rsa_sig_power_allocatednum_limbs = self
             .rsa_sig_power
             .into_iter()
@@ -299,8 +340,9 @@ where
             })
             .collect::<Result<Vec<_>, SynthesisError>>()?;
 
-        let aadhaar_io_hasher = AadhaarIOHasher::<Scalar>::new(2 + BIGNAT_NUM_LIMBS as u32);
+        let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
         let mut io_hash_preimage = current_sha256_digest_scalars.clone();
+        io_hash_preimage.push(prev_nullifier.clone());
         io_hash_preimage.extend(rsa_sig_power_allocatednum_limbs.clone().into_iter());
         let calc_io_hash = aadhaar_io_hasher.hash_in_circuit(
             &mut cs.namespace(|| "hash non-deterministic inputs"),
@@ -318,7 +360,6 @@ where
             &Boolean::Constant(true),
         )?;
 
-        // Compute SHA256 hash of the pair of message blocks
         let first_sha256_msg_block_bits =
             bytes_to_bits(&self.sha256_msg_block_pair[0..SHA256_BLOCK_LENGTH_BYTES]);
         let second_sha256_msg_block_bits =
@@ -417,6 +458,64 @@ where
             &age_gte_18,
         )?;
 
+        // Nullifier calculation
+        let mut two_sha256_msg_blocks_without_timestamp = vec![];
+        for i in 0..TIMESTAMP_START_BYTE_INDEX * 8 {
+            two_sha256_msg_blocks_without_timestamp.push(two_sha256_msg_blocks[i].clone());
+        }
+        for _i in TIMESTAMP_START_BYTE_INDEX * 8..NAME_START_BYTE_INDEX * 8 {
+            two_sha256_msg_blocks_without_timestamp.push(Boolean::Constant(false));
+        }
+        for i in NAME_START_BYTE_INDEX * 8..2 * SHA256_BLOCK_LENGTH_BYTES * 8 {
+            two_sha256_msg_blocks_without_timestamp.push(two_sha256_msg_blocks[i].clone());
+        }
+
+        let mut msg_block_alloc_nums_without_timestamp: Vec<AllocatedNum<Scalar>> = vec![];
+        two_sha256_msg_blocks_without_timestamp
+            .chunks(Scalar::CAPACITY as usize)
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, c)| {
+                let tmp = pack_bits(
+                    cs.namespace(|| format!("packs bits without timestamp {i}")),
+                    c,
+                )
+                .unwrap();
+                msg_block_alloc_nums_without_timestamp.push(tmp);
+            });
+
+        let mut msg_block_alloc_nums: Vec<AllocatedNum<Scalar>> = vec![];
+        two_sha256_msg_blocks
+            .chunks(Scalar::CAPACITY as usize)
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, c)| {
+                let tmp = pack_bits(cs.namespace(|| format!("packs bits with timestamp {i}")), c)
+                    .unwrap();
+                msg_block_alloc_nums.push(tmp);
+            });
+
+        let mut nullifier_msg_block_alloc_nums = conditionally_select_vec(
+            cs.namespace(|| "omit timestamp bits in first step"),
+            &msg_block_alloc_nums_without_timestamp,
+            &msg_block_alloc_nums,
+            &is_opcode_first_sha256,
+        )?;
+        nullifier_msg_block_alloc_nums.insert(0, prev_nullifier.clone());
+        let nullifier_hasher =
+            PoseidonHasher::<Scalar>::new(nullifier_msg_block_alloc_nums.len() as u32);
+        let new_nullifier = nullifier_hasher.hash_in_circuit(
+            &mut cs.namespace(|| "hash msg block scalars to get nullifier"),
+            &nullifier_msg_block_alloc_nums,
+        )?;
+        let nullifier = conditionally_select(
+            cs.namespace(|| "choose between new and prev nullifiers"),
+            &new_nullifier,
+            &prev_nullifier,
+            &is_opcode_sha256,
+        )?;
+
+        // Compute SHA256 hash of the pair of message blocks
         let first_sha256_io = super::sha256::compress(
             &mut cs.namespace(|| "Compress first SHA256 message block"),
             &first_sha256_msg_block_booleans,
@@ -476,7 +575,7 @@ where
             &rsa_signature,
         )?;
 
-        let rsa_sig_hasher = RSASigHasher::<Scalar>::new(BIGNAT_NUM_LIMBS as u32);
+        let rsa_sig_hasher = PoseidonHasher::<Scalar>::new(BIGNAT_NUM_LIMBS as u32);
         let rsa_sig_hash = rsa_sig_hasher.hash_in_circuit(
             &mut cs.namespace(|| "hash RSA sig scalars"),
             &rsa_signature_allocatednum_limbs,
@@ -585,17 +684,18 @@ where
         )?;
 
         let mut io_allocatednums = next_sha256_digest_scalars.clone();
+        io_allocatednums.push(nullifier.clone());
         io_allocatednums.extend(next_rsa_sig_power_allocatednum_limbs.into_iter());
 
         let new_io_hash = aadhaar_io_hasher
             .hash_in_circuit(&mut cs.namespace(|| "hash IO"), &io_allocatednums)?;
 
-        // Pack the final SHA256 hash in two scalars for debugging. TODO: Fix this
-        let mut last_z_out = vec![next_opcode.clone()];
-        last_z_out.extend(next_sha256_digest_scalars.into_iter());
+        // The next_opcode is repeated as a placeholder
+        let mut last_z_out = vec![next_opcode.clone(), next_opcode.clone()];
+        last_z_out.push(nullifier.clone());
 
         let z_out = conditionally_select_vec(
-            cs.namespace(|| "Choose between current and next SHA256 masked digests"),
+            cs.namespace(|| "Choose between outputs of last opcode and others"),
             &last_z_out,
             &[next_opcode, new_io_hash, rsa_sig_hash],
             &is_opcode_last_rsa,

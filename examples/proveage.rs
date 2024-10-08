@@ -6,10 +6,10 @@ use flate2::{write::ZlibEncoder, Compression};
 use image::{self};
 use nova_aadhaar_qr::{
     circuit::{AadhaarAgeProofCircuit, OP_RSA_LAST, OP_SHA256_FIRST},
-    poseidon::AadhaarIOHasher,
+    poseidon::PoseidonHasher,
     qr::parse_aadhaar_qr_data,
     rsa::BIGNAT_NUM_LIMBS,
-    sha256::{sha256_initial_digest_scalars, sha256_scalars_to_digest},
+    sha256::sha256_initial_digest_scalars,
 };
 use nova_snark::{
     provider::{PallasEngine, VestaEngine},
@@ -17,7 +17,6 @@ use nova_snark::{
     CompressedSNARK, PublicParams, RecursiveSNARK,
 };
 use num_bigint::BigInt;
-use sha2::{Digest, Sha256};
 use zlib_rs::{
     inflate::{uncompress_slice, InflateConfig},
     ReturnCode,
@@ -115,9 +114,10 @@ fn main() {
     let initial_opcode = <E1 as Engine>::Scalar::from(OP_SHA256_FIRST);
 
     let aadhaar_io_hasher =
-        AadhaarIOHasher::<<E1 as Engine>::Scalar>::new(2 + BIGNAT_NUM_LIMBS as u32);
+        PoseidonHasher::<<E1 as Engine>::Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
     let mut initial_io_values = sha256_iv;
-    initial_io_values.extend_from_slice(&[<E1 as Engine>::Scalar::zero(); BIGNAT_NUM_LIMBS]);
+    // The +1 is for the previous nullifier hash
+    initial_io_values.extend_from_slice(&[<E1 as Engine>::Scalar::zero(); BIGNAT_NUM_LIMBS + 1]);
     let initial_io_hash = aadhaar_io_hasher.hash(&initial_io_values);
 
     let current_date_bits = bytes_to_bits(current_date_bytes);
@@ -225,18 +225,5 @@ fn main() {
     let final_opcode = final_outputs[0];
     assert_eq!(final_opcode, <E1 as Engine>::Scalar::from(OP_RSA_LAST + 1));
 
-    let calculated_revealed_data_hash =
-        sha256_scalars_to_digest(final_outputs[1..].try_into().unwrap());
-    println!(
-        "Calculated revealed data hash  = {}",
-        hex::encode(calculated_revealed_data_hash)
-    );
-
-    let mut hasher = Sha256::new();
-    hasher.update(aadhaar_qr_data.signed_data);
-    let expected_revealed_data_hash: [u8; 32] = hasher.finalize().try_into().unwrap();
-    println!(
-        "Expected revealed data hash    = {}",
-        hex::encode(expected_revealed_data_hash)
-    );
+    println!("Nullifier = {:?}", final_outputs[2]);
 }

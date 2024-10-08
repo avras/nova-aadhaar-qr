@@ -4,7 +4,7 @@ const DELIMITER: u8 = 255;
 const CHAR_V: u8 = 86; // Corresponds to "V"
 const CHAR_2: u8 = 50; // Corresponds to "2"
 const CHAR_3: u8 = 51; // Corresponds to "3"
-const DOB_LENGTH_BYTES: usize = 10; // Date of birth is in DD-MM-YYYY format
+pub const DOB_LENGTH_BYTES: usize = 10; // Date of birth is in DD-MM-YYYY format
 const NUM_DELIMITERS_BEFORE_DOB: usize = 4; // Date of birth is the 4th field in the QR code data
 const DATA_LENGTH_PER_STEP: usize = 128; // 128 bytes will be hashed per Nova step
 

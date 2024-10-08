@@ -25,8 +25,8 @@ use crate::{
         RSA_MODULUS_LENGTH_BYTES,
     },
     sha256::{
-        sha256_digest_to_scalars, sha256_msg_block_sequence, sha256_state_to_bytes,
-        SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
+        sha256_digest_to_scalars, sha256_initial_digest_scalars, sha256_msg_block_sequence,
+        sha256_state_to_bytes, SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
     },
     util::{
         alloc_constant, alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs,
@@ -90,6 +90,25 @@ where
         let nullifier_hasher = PoseidonHasher::new(msg_blocks_scalars.len() as u32);
         let next_nullifier = nullifier_hasher.hash(&msg_blocks_scalars);
         next_nullifier
+    }
+
+    pub fn calc_initial_primary_circuit_input(current_date_bytes: &[u8]) -> Vec<Scalar> {
+        let sha256_iv = sha256_initial_digest_scalars::<Scalar>();
+        let initial_opcode = Scalar::from(OP_SHA256_FIRST);
+
+        let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
+        let mut initial_io_values = sha256_iv;
+        // The +1 is for the previous nullifier hash
+        initial_io_values.extend_from_slice(&[Scalar::ZERO; BIGNAT_NUM_LIMBS + 1]);
+        let initial_io_hash = aadhaar_io_hasher.hash(&initial_io_values);
+
+        let current_date_bits = bytes_to_bits(current_date_bytes);
+        let current_date_scalars = compute_multipacking::<Scalar>(&current_date_bits);
+        assert_eq!(current_date_scalars.len(), 1);
+        let current_date_scalar = current_date_scalars[0];
+
+        // The last scalar corresponds to the current date
+        vec![initial_opcode, initial_io_hash, current_date_scalar]
     }
 
     pub fn new_state_sequence(

@@ -1,15 +1,11 @@
 use std::time::Instant;
 
-use bellpepper::gadgets::multipack::{bytes_to_bits, compute_multipacking};
 use clap::Command;
 use flate2::{write::ZlibEncoder, Compression};
 use image::{self};
 use nova_aadhaar_qr::{
-    circuit::{AadhaarAgeProofCircuit, OP_RSA_LAST, OP_SHA256_FIRST},
-    poseidon::PoseidonHasher,
+    circuit::{AadhaarAgeProofCircuit, OP_RSA_LAST},
     qr::parse_aadhaar_qr_data,
-    rsa::BIGNAT_NUM_LIMBS,
-    sha256::sha256_initial_digest_scalars,
 };
 use nova_snark::{
     provider::{PallasEngine, VestaEngine},
@@ -110,24 +106,7 @@ fn main() {
 
     let primary_circuit_sequence = C1::new_state_sequence(&aadhaar_qr_data);
 
-    let sha256_iv = sha256_initial_digest_scalars::<<E1 as Engine>::Scalar>();
-    let initial_opcode = <E1 as Engine>::Scalar::from(OP_SHA256_FIRST);
-
-    let aadhaar_io_hasher =
-        PoseidonHasher::<<E1 as Engine>::Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
-    let mut initial_io_values = sha256_iv;
-    // The +1 is for the previous nullifier hash
-    initial_io_values.extend_from_slice(&[<E1 as Engine>::Scalar::zero(); BIGNAT_NUM_LIMBS + 1]);
-    let initial_io_hash = aadhaar_io_hasher.hash(&initial_io_values);
-
-    let current_date_bits = bytes_to_bits(current_date_bytes);
-    let current_date_scalars = compute_multipacking::<<E1 as Engine>::Scalar>(&current_date_bits);
-    assert_eq!(current_date_scalars.len(), 1);
-    let current_date_scalar = current_date_scalars[0];
-
-    // The last scalar corresponds to the current date
-    let z0_primary = vec![initial_opcode, initial_io_hash, current_date_scalar];
-
+    let z0_primary = C1::calc_initial_primary_circuit_input(current_date_bytes);
     let z0_secondary = vec![<E2 as Engine>::Scalar::zero()];
 
     let proof_gen_timer = Instant::now();

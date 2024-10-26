@@ -10,7 +10,7 @@ use nova_aadhaar_qr::{
 use nova_snark::{
     provider::{PallasEngine, VestaEngine},
     traits::{circuit::TrivialCircuit, snark::RelaxedR1CSSNARKTrait, Engine},
-    CompressedSNARK, PublicParams, RecursiveSNARK, FINAL_EXTERNAL_COUNTER,
+    CompressedSNARK, PublicParams, RecursiveSNARK,
 };
 use num_bigint::BigInt;
 use zlib_rs::{
@@ -61,12 +61,12 @@ fn main() {
     type E2 = VestaEngine;
     type EE1 = nova_snark::provider::ipa_pc::EvaluationEngine<E1>;
     type EE2 = nova_snark::provider::ipa_pc::EvaluationEngine<E2>;
-    type S1 = nova_snark::spartan::zksnark::RelaxedR1CSSNARK<E1, EE1>;
-    type S2 = nova_snark::spartan::zksnark::RelaxedR1CSSNARK<E2, EE2>;
+    type S1 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E1, EE1>;
+    type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>;
     type C1 = AadhaarAgeProofCircuit<<E1 as Engine>::Scalar>;
     type C2 = TrivialCircuit<<E2 as Engine>::Scalar>;
     let circuit_primary: C1 = AadhaarAgeProofCircuit::default();
-    let circuit_secondary: C2 = TrivialCircuit::new(nova_snark::StepCounterType::External);
+    let circuit_secondary: C2 = TrivialCircuit::default();
 
     let param_gen_timer = Instant::now();
     println!("Producing public parameters...");
@@ -139,10 +139,11 @@ fn main() {
         start.elapsed()
     );
 
+    let num_steps = primary_circuit_sequence.len();
     // verify the recursive SNARK
     println!("Verifying a RecursiveSNARK...");
     let start = Instant::now();
-    let res = recursive_snark.verify(&pp, FINAL_EXTERNAL_COUNTER, &z0_primary, &z0_secondary);
+    let res = recursive_snark.verify(&pp, num_steps, &z0_primary, &z0_secondary);
     println!(
         "RecursiveSNARK::verify: {:?}, took {:?}",
         res.is_ok(),
@@ -180,7 +181,7 @@ fn main() {
     // verify the compressed SNARK
     println!("Verifying a CompressedSNARK...");
     let start = Instant::now();
-    let res = compressed_snark.verify(&vk, FINAL_EXTERNAL_COUNTER, &z0_primary, &z0_secondary);
+    let res = compressed_snark.verify(&vk, num_steps, &z0_primary, &z0_secondary);
     let verification_time = start.elapsed();
     println!(
         "CompressedSNARK::verify: {:?}, took {:?}",

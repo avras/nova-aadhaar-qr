@@ -3,7 +3,7 @@ use std::io::Error;
 const DELIMITER: u8 = 255;
 const CHAR_V: u8 = 86; // Corresponds to "V"
 const CHAR_2: u8 = 50; // Corresponds to "2"
-const CHAR_3: u8 = 51; // Corresponds to "3"
+const CHAR_4: u8 = 52; // Corresponds to "4"
 pub const DOB_LENGTH_BYTES: usize = 10; // Date of birth is in DD-MM-YYYY format
 const NUM_DELIMITERS_BEFORE_DOB: usize = 4; // Date of birth is the 4th field in the QR code data
 const DATA_LENGTH_PER_STEP: usize = 128; // 128 bytes will be hashed per Nova step
@@ -23,8 +23,8 @@ pub fn parse_aadhaar_qr_data(qr_data: Vec<u8>) -> Result<AadhaarQRData, Error> {
         ));
     }
 
-    if qr_data[0] != CHAR_V || (qr_data[1] != CHAR_2 && qr_data[1] != CHAR_3) {
-        return Err(Error::other("Aadhaar QR code version is neither V2 nor V3"));
+    if qr_data[0] != CHAR_V || !(qr_data[1] >= CHAR_2 && qr_data[1] <= CHAR_4) {
+        return Err(Error::other("Aadhaar QR code version is neither V2 nor V3 nor V4"));
     }
 
     let mut num_delimiters_seen = 0;

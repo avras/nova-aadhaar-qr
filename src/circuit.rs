@@ -277,21 +277,21 @@ where
             opcode,
             Scalar::from(OP_SHA256_FIRST),
         )?;
-        let is_opcode_other_sha256 = alloc_num_equals_constant(
+        let is_opcode_not_first_sha256 = alloc_num_equals_constant(
             cs.namespace(|| "SHA256 opcode other than the first flag"),
             opcode,
             Scalar::from(OP_SHA256_OTHER),
         )?;
         let is_opcode_last_sha256 = Boolean::and(
             cs.namespace(|| "last SHA256 opcode flag"),
-            &is_opcode_other_sha256,
+            &is_opcode_not_first_sha256,
             &is_next_opcode_equal_to_opcode.not(),
         )?;
 
         let is_opcode_sha256 = Boolean::or(
             cs.namespace(|| "first or other SHA256"),
             &is_opcode_first_sha256,
-            &is_opcode_other_sha256,
+            &is_opcode_not_first_sha256,
         )?;
 
         let is_opcode_rsa = is_opcode_sha256.not();
@@ -550,17 +550,23 @@ where
             .unwrap(),
         );
 
+        let is_opcode_not_last_sha256_or_num_sha256_msg_blocks_even = Boolean::or(
+            cs.namespace(|| "not last SHA256 opcode OR number of SHA256 blocks is even"),
+            &is_opcode_last_sha256.not(),
+            &num_sha256_msg_blocks_even,
+        )?;
+
         let first_or_second_sha256_digest_scalars = conditionally_select_vec(
             cs.namespace(|| "Choose between first and second SHA256 digests"),
             &second_sha256_io.next_digest_scalars,
             &first_sha256_io.next_digest_scalars,
-            &num_sha256_msg_blocks_even,
+            &is_opcode_not_last_sha256_or_num_sha256_msg_blocks_even,
         )?;
         let first_or_second_sha256_digest_bits = conditionally_select_boolean_vec(
             cs.namespace(|| "Choose between first and second SHA256 digest bits"),
             &second_sha256_io.next_digest_bits,
             &first_sha256_io.next_digest_bits,
-            &num_sha256_msg_blocks_even,
+            &is_opcode_not_last_sha256_or_num_sha256_msg_blocks_even,
         )?;
         let next_sha256_digest_scalars = conditionally_select_vec(
             cs.namespace(|| "Choose between current and next SHA256 digests"),

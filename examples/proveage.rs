@@ -4,7 +4,7 @@ use clap::Command;
 use flate2::{write::ZlibEncoder, Compression};
 use image::{self};
 use nova_aadhaar_qr::{
-    circuit::{AadhaarAgeProofCircuit, OP_RSA_LAST},
+    circuit::{AadhaarAgeProofCircuit, OP_CODE_LAST},
     qr::parse_aadhaar_qr_data,
 };
 use nova_snark::{
@@ -202,7 +202,7 @@ fn main() {
     let final_outputs = res.unwrap().0;
 
     let final_opcode = final_outputs[0];
-    assert_eq!(final_opcode, <E1 as Engine>::Scalar::from(OP_RSA_LAST + 1));
+    assert_eq!(final_opcode, <E1 as Engine>::Scalar::from(OP_CODE_LAST + 1));
 
     println!("Nullifier = {:?}", final_outputs[2]);
 }

@@ -394,6 +394,33 @@ where
     Ok(a_bits)
 }
 
+/// Check that the recomposition of a scalar from little-endian
+/// bits in `bits_le` equals the allocated value in `a`
+pub(crate) fn check_decomposition<Scalar, CS>(
+    mut cs: CS,
+    a: &AllocatedNum<Scalar>,
+    bits_le: Vec<Boolean>,
+) -> Result<(), SynthesisError>
+where
+    Scalar: PrimeFieldBits,
+    CS: ConstraintSystem<Scalar>,
+{
+    let mut recomposed_lc = LinearCombination::<Scalar>::zero();
+    let mut coeff = Scalar::ONE;
+    for b in bits_le.iter() {
+        recomposed_lc = recomposed_lc + &b.lc(CS::one(), coeff);
+        coeff = coeff.double();
+    }
+    cs.enforce(
+        || "Check recomposed value equals allocated value",
+        |lc| lc + &recomposed_lc,
+        |lc| lc + CS::one(),
+        |lc| lc + a.get_variable(),
+    );
+
+    Ok(())
+}
+
 /// Takes two allocated numbers (a, b) that are assumed
 /// to be in the range `0` to `(1 << n_bits) - 1`.
 /// Returns an allocated `Boolean`` variable with value `true`

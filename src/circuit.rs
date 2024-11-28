@@ -30,15 +30,21 @@ use crate::{
     },
     util::{
         alloc_constant, alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs,
-        boolean_implies, conditionally_select, conditionally_select_boolean_vec,
-        conditionally_select_vec, less_than_or_equal,
+        boolean_implies, check_decomposition, conditionally_select,
+        conditionally_select_boolean_vec, conditionally_select_vec, less_than_or_equal,
+        num_to_bits,
     },
 };
 
-pub const OP_SHA256_FIRST: u64 = 0u64;
-pub const OP_SHA256_OTHER: u64 = 1u64;
-pub const OP_RSA_FIRST: u64 = 2u64;
-pub const OP_RSA_LAST: u64 = 18u64;
+pub const NUM_OPCODE_BITS: usize = 7; // 2 MS bits for SHA256 + 5 LS bits for RSA
+pub const NUM_RSA_OPCODE_BITS: u64 = 5;
+pub const RSA_OPCODE_MASK: u64 = (1 << NUM_RSA_OPCODE_BITS) - 1;
+pub const OP_SHA256_FIRST: u64 = 0;
+pub const OP_SHA256_OTHER: u64 = 1;
+pub const OP_SHA256_NOOP: u64 = 2;
+pub const OP_RSA_FIRST: u64 = 0;
+pub const OP_RSA_LAST: u64 = 16;
+pub const OP_CODE_LAST: u64 = (OP_SHA256_NOOP << NUM_RSA_OPCODE_BITS) + OP_RSA_LAST;
 
 const DATE_LENGTH_BYTES: usize = 10;
 const TIMESTAMP_START_BYTE_INDEX: usize = 9;
@@ -49,7 +55,8 @@ pub struct AadhaarAgeProofCircuit<Scalar>
 where
     Scalar: PrimeField,
 {
-    next_opcode: Scalar,
+    opcode: u64,
+    next_opcode: u64,
     num_sha256_msg_blocks_even: bool,
     dob_byte_index: usize,
     sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
@@ -65,7 +72,8 @@ where
 {
     fn default() -> Self {
         Self {
-            next_opcode: Scalar::ZERO,
+            opcode: 0,
+            next_opcode: 0,
             num_sha256_msg_blocks_even: false,
             dob_byte_index: 0,
             sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
@@ -94,7 +102,7 @@ where
 
     pub fn calc_initial_primary_circuit_input(current_date_bytes: &[u8]) -> Vec<Scalar> {
         let sha256_iv = sha256_initial_digest_scalars::<Scalar>();
-        let initial_opcode = Scalar::from(OP_SHA256_FIRST);
+        let initial_opcode = Scalar::from((OP_SHA256_FIRST << NUM_RSA_OPCODE_BITS) + OP_RSA_FIRST);
 
         let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
         let mut initial_io_values = sha256_iv;
@@ -122,19 +130,93 @@ where
         }
 
         let mut aadhaar_steps = vec![];
-        let other_sha256_opcode = Scalar::from(OP_SHA256_OTHER);
 
         let mut sha256_state = SHA256_IV;
         let mut prev_nullifier = Scalar::ZERO;
+        let first_opcode = (OP_SHA256_FIRST << NUM_RSA_OPCODE_BITS) + OP_RSA_FIRST;
+        let first_next_opcode = (OP_SHA256_OTHER << NUM_RSA_OPCODE_BITS) + OP_RSA_FIRST + 1u64;
+        let modulus_bigint = BigInt::from_bytes_be(Sign::Plus, &RSA_MODULUS_HEX_BYTES);
+        // Initialize the RSA signature power to the RSA signature value
+        let mut rsa_sig_power_bigint =
+            BigInt::from_bytes_be(Sign::Plus, &aadhaar_qr_data.rsa_signature);
+        let rsa_sig_scalars =
+            nat_to_limbs::<Scalar>(&rsa_sig_power_bigint, BIGNAT_LIMB_WIDTH, BIGNAT_NUM_LIMBS)
+                .unwrap()
+                .try_into()
+                .unwrap();
 
-        for i in 0..(sha256_msg_blocks.len() / 2) - 1 {
-            let sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] =
-                [sha256_msg_blocks[2 * i], sha256_msg_blocks[2 * i + 1]]
+        let first_sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] =
+            [sha256_msg_blocks[0], sha256_msg_blocks[1]]
+                .concat()
+                .try_into()
+                .unwrap();
+
+        // First step
+        aadhaar_steps.push(Self {
+            opcode: first_opcode,
+            next_opcode: first_next_opcode,
+            num_sha256_msg_blocks_even,
+            dob_byte_index: aadhaar_qr_data.dob_byte_index,
+            sha256_msg_block_pair: first_sha256_msg_block_pair,
+            current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state).try_into().unwrap(),
+            prev_nullifier,
+            rsa_sig: aadhaar_qr_data.rsa_signature.clone().try_into().unwrap(),
+            rsa_sig_power: rsa_sig_scalars,
+        });
+
+        // Square the signature
+        rsa_sig_power_bigint = rsa_sig_power_bigint.modpow(&BigInt::from(2u64), &modulus_bigint);
+
+        let msg_blocks_without_timestamp: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] = [
+            &first_sha256_msg_block_pair[0..TIMESTAMP_START_BYTE_INDEX],
+            &[0u8; NAME_START_BYTE_INDEX - TIMESTAMP_START_BYTE_INDEX],
+            &first_sha256_msg_block_pair[NAME_START_BYTE_INDEX..],
+        ]
+        .concat()
+        .try_into()
+        .unwrap();
+        prev_nullifier = Self::update_nullifier(prev_nullifier, &msg_blocks_without_timestamp);
+
+        compress256(
+            &mut sha256_state,
+            &[*GenericArray::from_slice(&sha256_msg_blocks[0])],
+        );
+        compress256(
+            &mut sha256_state,
+            &[*GenericArray::from_slice(&sha256_msg_blocks[1])],
+        );
+
+        // Append 16 RSA steps for repeated squaring (or multiplying) of the signature
+        for i in 1..=16 {
+            let mut sha256_msg_block_pair = [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES];
+            // We assume that the number 128-byte blocks in the QR code is less than 17. It usually 8 or 9
+            let opcode;
+            let next_opcode;
+            if i < sha256_msg_blocks.len() / 2 {
+                sha256_msg_block_pair = [sha256_msg_blocks[2 * i], sha256_msg_blocks[2 * i + 1]]
                     .concat()
                     .try_into()
                     .unwrap();
-            aadhaar_steps.push(Self {
-                next_opcode: other_sha256_opcode,
+                opcode = (OP_SHA256_OTHER << NUM_RSA_OPCODE_BITS) + OP_RSA_FIRST + i as u64;
+                if i == sha256_msg_blocks.len() / 2 - 1 {
+                    next_opcode = (OP_SHA256_NOOP << NUM_RSA_OPCODE_BITS) + (i + 1) as u64;
+                } else {
+                    next_opcode = opcode + 1;
+                }
+            } else {
+                opcode = (OP_SHA256_NOOP << NUM_RSA_OPCODE_BITS) + i as u64;
+                next_opcode = opcode + 1;
+            }
+
+            let rsa_sig_power_scalars =
+                nat_to_limbs::<Scalar>(&rsa_sig_power_bigint, BIGNAT_LIMB_WIDTH, BIGNAT_NUM_LIMBS)
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+
+            let step = Self {
+                opcode,
+                next_opcode,
                 num_sha256_msg_blocks_even,
                 dob_byte_index: aadhaar_qr_data.dob_byte_index,
                 sha256_msg_block_pair,
@@ -142,97 +224,25 @@ where
                     .try_into()
                     .unwrap(),
                 prev_nullifier,
-                rsa_sig: [0u8; RSA_MODULUS_LENGTH_BYTES],
-                rsa_sig_power: [Scalar::ZERO; BIGNAT_NUM_LIMBS],
-            });
-            compress256(
-                &mut sha256_state,
-                &[*GenericArray::from_slice(&sha256_msg_blocks[2 * i])],
-            );
-            compress256(
-                &mut sha256_state,
-                &[*GenericArray::from_slice(&sha256_msg_blocks[2 * i + 1])],
-            );
-
-            let msg_blocks_without_timestamp: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] = if i == 0 {
-                [
-                    &sha256_msg_block_pair[0..TIMESTAMP_START_BYTE_INDEX],
-                    &[0u8; NAME_START_BYTE_INDEX - TIMESTAMP_START_BYTE_INDEX],
-                    &sha256_msg_block_pair[NAME_START_BYTE_INDEX..],
-                ]
-                .concat()
-                .try_into()
-                .unwrap()
-            } else {
-                sha256_msg_block_pair
-            };
-            prev_nullifier = Self::update_nullifier(prev_nullifier, &msg_blocks_without_timestamp);
-        }
-
-        let first_rsa_opcode = Scalar::from(OP_RSA_FIRST);
-        let sha256_msg_block_pair: [u8; 2 * SHA256_BLOCK_LENGTH_BYTES] = [
-            sha256_msg_blocks[sha256_msg_blocks.len() - 2],
-            sha256_msg_blocks[sha256_msg_blocks.len() - 1],
-        ]
-        .concat()
-        .try_into()
-        .unwrap();
-        // Last SHA256 step
-        aadhaar_steps.push(Self {
-            next_opcode: first_rsa_opcode, // first RSA opcode
-            num_sha256_msg_blocks_even,
-            dob_byte_index: aadhaar_qr_data.dob_byte_index,
-            sha256_msg_block_pair,
-            current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state).try_into().unwrap(),
-            prev_nullifier,
-            rsa_sig: aadhaar_qr_data.rsa_signature.clone().try_into().unwrap(),
-            rsa_sig_power: [Scalar::ZERO; BIGNAT_NUM_LIMBS],
-        });
-        let final_nullifier = Self::update_nullifier(prev_nullifier, &sha256_msg_block_pair);
-
-        compress256(
-            &mut sha256_state,
-            &[*GenericArray::from_slice(
-                &sha256_msg_blocks[sha256_msg_blocks.len() - 2],
-            )],
-        );
-        if num_sha256_msg_blocks_even {
-            compress256(
-                &mut sha256_state,
-                &[*GenericArray::from_slice(
-                    &sha256_msg_blocks[sha256_msg_blocks.len() - 1],
-                )],
-            );
-        }
-
-        let modulus_bigint = BigInt::from_bytes_be(Sign::Plus, &RSA_MODULUS_HEX_BYTES);
-        // Initialize the RSA signature power to the RSA signature value
-        let mut rsa_sig_power_bigint =
-            BigInt::from_bytes_be(Sign::Plus, &aadhaar_qr_data.rsa_signature);
-
-        // Append 17 RSA steps for repeated squaring of the signature
-        for i in 1..=17 {
-            let rsa_sig_power_scalars =
-                nat_to_limbs::<Scalar>(&rsa_sig_power_bigint, BIGNAT_LIMB_WIDTH, BIGNAT_NUM_LIMBS)
-                    .unwrap()
-                    .try_into()
-                    .unwrap();
-            let next_opcode = first_rsa_opcode + Scalar::from(i);
-
-            let rsa_step = Self {
-                next_opcode,
-                num_sha256_msg_blocks_even,
-                dob_byte_index: aadhaar_qr_data.dob_byte_index,
-                sha256_msg_block_pair: [0u8; 2 * SHA256_BLOCK_LENGTH_BYTES],
-                current_sha256_digest_bytes: sha256_state_to_bytes(sha256_state)
-                    .try_into()
-                    .unwrap(),
-                prev_nullifier: final_nullifier,
                 rsa_sig: aadhaar_qr_data.rsa_signature.clone().try_into().unwrap(),
                 rsa_sig_power: rsa_sig_power_scalars,
             };
 
-            aadhaar_steps.push(rsa_step);
+            aadhaar_steps.push(step);
+
+            if i < sha256_msg_blocks.len() / 2 {
+                compress256(
+                    &mut sha256_state,
+                    &[*GenericArray::from_slice(&sha256_msg_blocks[2 * i])],
+                );
+                if i != sha256_msg_blocks.len() / 2 - 1 || num_sha256_msg_blocks_even {
+                    compress256(
+                        &mut sha256_state,
+                        &[*GenericArray::from_slice(&sha256_msg_blocks[2 * i + 1])],
+                    );
+                }
+                prev_nullifier = Self::update_nullifier(prev_nullifier, &sha256_msg_block_pair);
+            }
             rsa_sig_power_bigint =
                 rsa_sig_power_bigint.modpow(&BigInt::from(2u64), &modulus_bigint);
         }
@@ -255,73 +265,138 @@ where
         z: &[AllocatedNum<Scalar>],
     ) -> Result<Vec<AllocatedNum<Scalar>>, SynthesisError> {
         let opcode = &z[0];
-        let next_opcode =
-            AllocatedNum::alloc(cs.namespace(|| "next opcode"), || Ok(self.next_opcode))?;
+        let next_opcode = AllocatedNum::alloc(cs.namespace(|| "next opcode"), || {
+            Ok(Scalar::from(self.next_opcode))
+        })?;
+        // check that opcode fits in 7 bits
+        let opcode_bits_le =
+            num_to_bits(cs.namespace(|| "Decompose opcode"), opcode, NUM_OPCODE_BITS)?;
+        let sha256_opcode_bits_le = opcode_bits_le[NUM_RSA_OPCODE_BITS as usize..].to_vec();
+        let rsa_opcode_bits_le = opcode_bits_le[..NUM_RSA_OPCODE_BITS as usize].to_vec();
 
-        // Constraints related to the opcode input
+        // Allocate SHA256 and RSA opcodes
+        let sha256_opcode = AllocatedNum::alloc(cs.namespace(|| "SHA256 opcode"), || {
+            Ok(Scalar::from(self.opcode >> NUM_RSA_OPCODE_BITS))
+        })?;
+        let rsa_opcode = AllocatedNum::alloc(cs.namespace(|| "RSA opcode"), || {
+            Ok(Scalar::from(self.opcode & RSA_OPCODE_MASK))
+        })?;
+
+        // check allocated sha256 opcode matches with input opcode bits
+        check_decomposition(
+            cs.namespace(|| "check SHA256 opcode allocation"),
+            &sha256_opcode,
+            sha256_opcode_bits_le,
+        )?;
+        // check allocated RSA opcode matches with input opcode bits
+        check_decomposition(
+            cs.namespace(|| "check RSA opcode allocation"),
+            &rsa_opcode,
+            rsa_opcode_bits_le,
+        )?;
+
+        // check that next opcode fits in 7 bits
+        let next_opcode_bits_le = num_to_bits(
+            cs.namespace(|| "Decompose next opcode"),
+            &next_opcode,
+            NUM_OPCODE_BITS,
+        )?;
+        let next_sha256_opcode_bits_le =
+            next_opcode_bits_le[NUM_RSA_OPCODE_BITS as usize..].to_vec();
+        let next_rsa_opcode_bits_le = next_opcode_bits_le[..NUM_RSA_OPCODE_BITS as usize].to_vec();
+
+        let next_sha256_opcode =
+            AllocatedNum::alloc(cs.namespace(|| "next SHA256 opcode"), || {
+                Ok(Scalar::from(self.next_opcode >> NUM_RSA_OPCODE_BITS))
+            })?;
+        let next_rsa_opcode = AllocatedNum::alloc(cs.namespace(|| "next RSA opcode"), || {
+            Ok(Scalar::from(self.next_opcode & RSA_OPCODE_MASK))
+        })?;
+
+        // check allocated next sha256 opcode matches with allocated next opcode bits
+        check_decomposition(
+            cs.namespace(|| "check next SHA256 opcode allocation"),
+            &next_sha256_opcode,
+            next_sha256_opcode_bits_le,
+        )?;
+        // check allocated next RSA opcode matches with input opcode bits
+        check_decomposition(
+            cs.namespace(|| "check next RSA opcode allocation"),
+            &next_rsa_opcode,
+            next_rsa_opcode_bits_le,
+        )?;
+
+        // Constraints related to the opcode inputs
         cs.enforce(
-            || "next opcode is opcode or opcode+1",
-            |lc| lc + opcode.get_variable() - next_opcode.get_variable(),
-            |lc| lc + CS::one() + opcode.get_variable() - next_opcode.get_variable(),
+            || "next RSA opcode is always one more than current RSA opcode",
+            |lc| lc + next_rsa_opcode.get_variable(),
+            |lc| lc + CS::one(),
+            |lc| lc + CS::one() + rsa_opcode.get_variable(),
+        );
+
+        cs.enforce(
+            || "next SHA256 opcode is identical or one more",
+            |lc| lc + sha256_opcode.get_variable() - next_sha256_opcode.get_variable(),
+            |lc| lc + CS::one() + sha256_opcode.get_variable() - next_sha256_opcode.get_variable(),
             |lc| lc,
         );
 
-        let is_next_opcode_equal_to_opcode = alloc_num_equals(
-            cs.namespace(|| "opcode and next opcode are equal"),
-            opcode,
-            &next_opcode,
+        let is_next_sha256_opcode_equal_to_sha256_opcode = alloc_num_equals(
+            cs.namespace(|| "SHA256 opcode and next SHA256 opcode are equal"),
+            &sha256_opcode,
+            &next_sha256_opcode,
         )?;
 
-        let is_opcode_first_sha256 = alloc_num_equals_constant(
+        let is_sha256_opcode_first_sha256 = alloc_num_equals_constant(
             cs.namespace(|| "first SHA256 opcode flag"),
-            opcode,
+            &sha256_opcode,
             Scalar::from(OP_SHA256_FIRST),
         )?;
-        let is_opcode_not_first_sha256 = alloc_num_equals_constant(
-            cs.namespace(|| "SHA256 opcode other than the first flag"),
-            opcode,
+        let is_sha256_opcode_other_sha256 = alloc_num_equals_constant(
+            cs.namespace(|| "first SHA256 opcode flag"),
+            &sha256_opcode,
             Scalar::from(OP_SHA256_OTHER),
         )?;
-        let is_opcode_last_sha256 = Boolean::and(
+        let is_sha256_opcode_noop_sha256 = alloc_num_equals_constant(
+            cs.namespace(|| "No-op SHA256 opcode flag"),
+            &sha256_opcode,
+            Scalar::from(OP_SHA256_NOOP),
+        )?;
+        let is_next_sha256_opcode_noop_sha256 = alloc_num_equals_constant(
+            cs.namespace(|| "Next SHA256 is No-op SHA256 opcode flag"),
+            &next_sha256_opcode,
+            Scalar::from(OP_SHA256_NOOP),
+        )?;
+
+        let is_sha256_opcode_last_sha256 = Boolean::and(
             cs.namespace(|| "last SHA256 opcode flag"),
-            &is_opcode_not_first_sha256,
-            &is_next_opcode_equal_to_opcode.not(),
+            &is_sha256_opcode_other_sha256,
+            &is_next_sha256_opcode_noop_sha256,
         )?;
+        let is_sha256_opcode_active = is_sha256_opcode_noop_sha256.not();
 
-        let is_opcode_sha256 = Boolean::or(
-            cs.namespace(|| "first or other SHA256"),
-            &is_opcode_first_sha256,
-            &is_opcode_not_first_sha256,
-        )?;
-
-        let is_opcode_rsa = is_opcode_sha256.not();
-        let _is_opcode_first_rsa = alloc_num_equals_constant(
+        let is_rsa_opcode_first_rsa = alloc_num_equals_constant(
             cs.namespace(|| "first RSA opcode flag"),
-            opcode,
+            &rsa_opcode,
             Scalar::from(OP_RSA_FIRST),
         )?;
         let is_opcode_last_rsa = alloc_num_equals_constant(
             cs.namespace(|| "last RSA opcode flag"),
-            opcode,
+            &rsa_opcode,
             Scalar::from(OP_RSA_LAST),
         )?;
 
-        let mut should_next_opcode_be_one_more = Boolean::or(
+        let should_next_sha256_opcode_be_one_more = Boolean::or(
             cs.namespace(|| "first SHA256 OR last SHA256"),
-            &is_opcode_first_sha256,
-            &is_opcode_last_sha256,
-        )?;
-        should_next_opcode_be_one_more = Boolean::or(
-            cs.namespace(|| "first SHA256 OR last SHA256 OR RSA"),
-            &should_next_opcode_be_one_more,
-            &is_opcode_rsa,
+            &is_sha256_opcode_first_sha256,
+            &is_sha256_opcode_last_sha256,
         )?;
 
-        // if opcode is RSA, next opcode should be 1 more
+        // if opcode is first or last SHA256, next opcode should be 1 more
         boolean_implies(
-            cs.namespace(|| "if opcode is RSA, then next opcode is incremented"),
-            &should_next_opcode_be_one_more,
-            &is_next_opcode_equal_to_opcode.not(),
+            cs.namespace(|| "if opcode is first or last SHA256, then next opcode is incremented"),
+            &should_next_sha256_opcode_be_one_more,
+            &is_next_sha256_opcode_equal_to_sha256_opcode.not(),
         )?;
 
         // Check that the non-deterministic inputs hash to the expected value
@@ -354,11 +429,26 @@ where
                 )
             })
             .collect::<Result<Vec<_>, SynthesisError>>()?;
+        let allocated_zero_limbs = (0..BIGNAT_NUM_LIMBS)
+            .into_iter()
+            .map(|i| {
+                alloc_constant(
+                    cs.namespace(|| format!("alloc zero limb {i}")),
+                    Scalar::ZERO,
+                )
+            })
+            .collect::<Result<Vec<_>, SynthesisError>>()?;
+        let limbs_to_be_hashed = conditionally_select_vec(
+            cs.namespace(|| "select between actual RSA sig power and zero limbs"),
+            &allocated_zero_limbs,
+            &rsa_sig_power_allocatednum_limbs,
+            &is_sha256_opcode_first_sha256,
+        )?;
 
         let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
         let mut io_hash_preimage = current_sha256_digest_scalars.clone();
         io_hash_preimage.push(prev_nullifier.clone());
-        io_hash_preimage.extend(rsa_sig_power_allocatednum_limbs.clone().into_iter());
+        io_hash_preimage.extend(limbs_to_be_hashed.clone().into_iter());
         let calc_io_hash = aadhaar_io_hasher.hash_in_circuit(
             &mut cs.namespace(|| "hash non-deterministic inputs"),
             &io_hash_preimage,
@@ -422,7 +512,7 @@ where
         )?;
         boolean_implies(
             cs.namespace(|| "if first SHA256 step then delimiter count must be correct"),
-            &is_opcode_first_sha256,
+            &is_sha256_opcode_first_sha256,
             &delimiter_count_correct,
         )?;
 
@@ -438,7 +528,7 @@ where
         let (day, month, year) = get_day_month_year_conditional(
             cs.namespace(|| "get birth day, month, year"),
             &shifted_msg_blocks[0..DATE_LENGTH_BYTES * 8],
-            &is_opcode_first_sha256,
+            &is_sha256_opcode_first_sha256,
         )?;
 
         let mut current_date_bits = z[2].to_bits_le(cs.namespace(|| "alloc current date bits"))?;
@@ -447,7 +537,7 @@ where
         let (current_day, current_month, current_year) = get_day_month_year_conditional(
             cs.namespace(|| "get current birth day, month, year"),
             &current_date_bits,
-            &is_opcode_first_sha256,
+            &is_sha256_opcode_first_sha256,
         )?;
 
         let age = calculate_age_in_years(
@@ -458,7 +548,7 @@ where
             &current_day,
             &current_month,
             &current_year,
-            &is_opcode_first_sha256,
+            &is_sha256_opcode_first_sha256,
         )?;
         let age18 = alloc_constant(cs.namespace(|| "alloc 18"), Scalar::from(18u64))?;
         let age_gte_18 = less_than_or_equal(
@@ -469,7 +559,7 @@ where
         )?;
         boolean_implies(
             cs.namespace(|| "if first SHA256 step then age must at least 18"),
-            &is_opcode_first_sha256,
+            &is_sha256_opcode_first_sha256,
             &age_gte_18,
         )?;
 
@@ -514,7 +604,7 @@ where
             cs.namespace(|| "omit timestamp bits in first step"),
             &msg_block_alloc_nums_without_timestamp,
             &msg_block_alloc_nums,
-            &is_opcode_first_sha256,
+            &is_sha256_opcode_first_sha256,
         )?;
         nullifier_msg_block_alloc_nums.insert(0, prev_nullifier.clone());
         let nullifier_hasher =
@@ -527,7 +617,7 @@ where
             cs.namespace(|| "choose between new and prev nullifiers"),
             &new_nullifier,
             &prev_nullifier,
-            &is_opcode_sha256,
+            &is_sha256_opcode_active,
         )?;
 
         // Compute SHA256 hash of the pair of message blocks
@@ -552,7 +642,7 @@ where
 
         let is_opcode_not_last_sha256_or_num_sha256_msg_blocks_even = Boolean::or(
             cs.namespace(|| "not last SHA256 opcode OR number of SHA256 blocks is even"),
-            &is_opcode_last_sha256.not(),
+            &is_sha256_opcode_last_sha256.not(),
             &num_sha256_msg_blocks_even,
         )?;
 
@@ -572,13 +662,13 @@ where
             cs.namespace(|| "Choose between current and next SHA256 digests"),
             &first_or_second_sha256_digest_scalars,
             &current_sha256_digest_scalars,
-            &is_opcode_sha256,
+            &is_sha256_opcode_active,
         )?;
         let next_sha256_digest_bits = conditionally_select_boolean_vec(
             cs.namespace(|| "Choose between current and next SHA256 digest bits"),
             &first_or_second_sha256_digest_bits,
             &first_sha256_io.current_digest_bits,
-            &is_opcode_sha256,
+            &is_sha256_opcode_active,
         )?;
 
         // Check that the hash of the non-deterministically provided RSA signature matches
@@ -609,8 +699,10 @@ where
         )?;
 
         boolean_implies(
-            cs.namespace(|| "if opcode is RSA, the RSA sig hash must be unchanged"),
-            &is_opcode_rsa,
+            cs.namespace(|| {
+                "if RSA opcode is not the first RSA opcode, then RSA sig hash must be unchanged"
+            }),
+            &is_rsa_opcode_first_rsa.not(),
             &is_rsa_sig_hash_unchanged,
         )?;
 
@@ -685,18 +777,6 @@ where
             cs.namespace(|| "last RSA opcode => RSA signature valid"),
             &is_opcode_last_rsa,
             &is_signature_valid,
-        )?;
-
-        let is_opcode_last_sha256_bit = Bit {
-            bit: is_opcode_last_sha256.lc(CS::one(), Scalar::ONE),
-            value: is_opcode_last_sha256.get_value(),
-        };
-
-        let next_rsa_sig_power = BigNat::<Scalar>::mux(
-            cs.namespace(|| "select between next sig power and initial sig value"),
-            &is_opcode_last_sha256_bit,
-            &next_rsa_sig_power,
-            &rsa_signature,
         )?;
 
         let next_rsa_sig_power_allocatednum_limbs = bignat_to_allocatednum_limbs(

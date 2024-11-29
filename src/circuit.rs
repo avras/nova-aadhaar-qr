@@ -791,9 +791,8 @@ where
         let new_io_hash = aadhaar_io_hasher
             .hash_in_circuit(&mut cs.namespace(|| "hash IO"), &io_allocatednums)?;
 
-        // The next_opcode is repeated as a placeholder
-        let mut last_z_out = vec![next_opcode.clone(), next_opcode.clone()];
-        last_z_out.push(nullifier.clone());
+        let zero = alloc_constant(cs.namespace(|| "alloc zero"), Scalar::ZERO)?;
+        let last_z_out = vec![next_opcode.clone(), zero, nullifier];
 
         let z_out = conditionally_select_vec(
             cs.namespace(|| "Choose between outputs of last opcode and others"),

@@ -204,5 +204,5 @@ fn main() {
     let final_opcode = final_outputs[0];
     assert_eq!(final_opcode, <E1 as Engine>::Scalar::from(OP_CODE_LAST + 1));
 
-    println!("Nullifier = {:?}", final_outputs[2]);
+    println!("Nullifier = {:?}", final_outputs[1]);
 }

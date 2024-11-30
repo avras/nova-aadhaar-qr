@@ -25,8 +25,8 @@ use crate::{
         RSA_MODULUS_LENGTH_BYTES,
     },
     sha256::{
-        sha256_digest_to_scalars, sha256_initial_digest_scalars, sha256_msg_block_sequence,
-        sha256_state_to_bytes, SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
+        sha256_digest_to_scalars, sha256_msg_block_sequence, sha256_state_to_bytes,
+        SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
     },
     util::{
         alloc_constant, alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs,
@@ -100,14 +100,7 @@ where
     }
 
     pub fn calc_initial_primary_circuit_input(current_date_bytes: &[u8]) -> Vec<Scalar> {
-        let sha256_iv = sha256_initial_digest_scalars::<Scalar>();
         let initial_opcode = Scalar::from((OP_SHA256_ACTIVE << NUM_RSA_OPCODE_BITS) + OP_RSA_FIRST);
-
-        let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
-        let mut initial_io_values = sha256_iv;
-        // The +1 is for the previous nullifier hash
-        initial_io_values.extend_from_slice(&[Scalar::ZERO; BIGNAT_NUM_LIMBS + 1]);
-        let initial_io_hash = aadhaar_io_hasher.hash(&initial_io_values);
 
         let current_date_bits = bytes_to_bits(current_date_bytes);
         let current_date_scalars = compute_multipacking::<Scalar>(&current_date_bits);
@@ -115,7 +108,7 @@ where
         let current_date_scalar = current_date_scalars[0];
 
         // The last scalar corresponds to the current date
-        vec![initial_opcode, initial_io_hash, current_date_scalar]
+        vec![initial_opcode, current_date_scalar]
     }
 
     pub fn new_state_sequence(
@@ -259,7 +252,7 @@ where
     Scalar: PrimeFieldBits,
 {
     fn arity(&self) -> usize {
-        3
+        2
     }
 
     fn synthesize<CS: ConstraintSystem<Scalar>>(
@@ -370,26 +363,23 @@ where
                 )
             })
             .collect::<Result<Vec<_>, SynthesisError>>()?;
-        let allocated_zero_limbs = (0..BIGNAT_NUM_LIMBS)
-            .into_iter()
-            .map(|i| {
-                alloc_constant(
-                    cs.namespace(|| format!("alloc zero limb {i}")),
-                    Scalar::ZERO,
-                )
-            })
-            .collect::<Result<Vec<_>, SynthesisError>>()?;
-        let limbs_to_be_hashed = conditionally_select_vec(
-            cs.namespace(|| "select between actual RSA sig power and zero limbs"),
-            &allocated_zero_limbs,
-            &rsa_sig_power_allocatednum_limbs,
-            &is_rsa_opcode_first_rsa,
+        let rsa_signature_bigint = BigInt::from_bytes_be(Sign::Plus, &self.rsa_sig);
+        let rsa_signature = BigNat::<Scalar>::alloc_from_nat(
+            cs.namespace(|| "alloc RSA signature"),
+            || Ok(rsa_signature_bigint),
+            BIGNAT_LIMB_WIDTH,
+            BIGNAT_NUM_LIMBS,
+        )?;
+        let rsa_signature_allocatednum_limbs = bignat_to_allocatednum_limbs(
+            &mut cs.namespace(|| "alloc RSA sig limbs"),
+            &rsa_signature,
         )?;
 
-        let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + BIGNAT_NUM_LIMBS as u32);
+        let aadhaar_io_hasher = PoseidonHasher::<Scalar>::new(3 + 2 * BIGNAT_NUM_LIMBS as u32);
         let mut io_hash_preimage = current_sha256_digest_scalars.clone();
         io_hash_preimage.push(prev_nullifier.clone());
-        io_hash_preimage.extend(limbs_to_be_hashed.clone().into_iter());
+        io_hash_preimage.extend(rsa_signature_allocatednum_limbs.clone().into_iter());
+        io_hash_preimage.extend(rsa_sig_power_allocatednum_limbs.clone().into_iter());
         let calc_io_hash = aadhaar_io_hasher.hash_in_circuit(
             &mut cs.namespace(|| "hash non-deterministic inputs"),
             &io_hash_preimage,
@@ -400,10 +390,10 @@ where
             io_hash,
             &calc_io_hash,
         )?;
-        Boolean::enforce_equal(
-            cs.namespace(|| "hashes must be equal"),
+        boolean_implies(
+            cs.namespace(|| "hashes must be equal in all steps except the first step"),
+            &is_rsa_opcode_first_rsa.not(),
             &io_hash_preimage_correct,
-            &Boolean::Constant(true),
         )?;
 
         let first_sha256_msg_block_bits =
@@ -472,7 +462,7 @@ where
             &is_rsa_opcode_first_rsa,
         )?;
 
-        let mut current_date_bits = z[2].to_bits_le(cs.namespace(|| "alloc current date bits"))?;
+        let mut current_date_bits = z[1].to_bits_le(cs.namespace(|| "alloc current date bits"))?;
         current_date_bits.truncate(DATE_LENGTH_BYTES * 8);
 
         let (current_day, current_month, current_year) = get_day_month_year_conditional(
@@ -612,41 +602,6 @@ where
             &is_sha256_opcode_active,
         )?;
 
-        // Check that the hash of the non-deterministically provided RSA signature matches
-        // the hash of the RSA signatures used in the previous step
-        let prev_rsa_sig_hash = &z[2];
-        let rsa_signature_bigint = BigInt::from_bytes_be(Sign::Plus, &self.rsa_sig);
-        let rsa_signature = BigNat::<Scalar>::alloc_from_nat(
-            cs.namespace(|| "alloc RSA signature"),
-            || Ok(rsa_signature_bigint),
-            BIGNAT_LIMB_WIDTH,
-            BIGNAT_NUM_LIMBS,
-        )?;
-        let rsa_signature_allocatednum_limbs = bignat_to_allocatednum_limbs(
-            &mut cs.namespace(|| "alloc RSA sig limbs"),
-            &rsa_signature,
-        )?;
-
-        let rsa_sig_hasher = PoseidonHasher::<Scalar>::new(BIGNAT_NUM_LIMBS as u32);
-        let rsa_sig_hash = rsa_sig_hasher.hash_in_circuit(
-            &mut cs.namespace(|| "hash RSA sig scalars"),
-            &rsa_signature_allocatednum_limbs,
-        )?;
-
-        let is_rsa_sig_hash_unchanged = alloc_num_equals(
-            cs.namespace(|| "RSA sig hashes equality flag"),
-            prev_rsa_sig_hash,
-            &rsa_sig_hash,
-        )?;
-
-        boolean_implies(
-            cs.namespace(|| {
-                "if RSA opcode is not the first RSA opcode, then RSA sig hash must be unchanged"
-            }),
-            &is_rsa_opcode_first_rsa.not(),
-            &is_rsa_sig_hash_unchanged,
-        )?;
-
         let rsa_sig_power_num_limbs = rsa_sig_power_allocatednum_limbs
             .iter()
             .map(|al| Num {
@@ -727,18 +682,18 @@ where
 
         let mut io_allocatednums = next_sha256_digest_scalars.clone();
         io_allocatednums.push(nullifier.clone());
+        io_allocatednums.extend(rsa_signature_allocatednum_limbs.into_iter());
         io_allocatednums.extend(next_rsa_sig_power_allocatednum_limbs.into_iter());
 
         let new_io_hash = aadhaar_io_hasher
             .hash_in_circuit(&mut cs.namespace(|| "hash IO"), &io_allocatednums)?;
 
-        let zero = alloc_constant(cs.namespace(|| "alloc zero"), Scalar::ZERO)?;
-        let last_z_out = vec![next_opcode.clone(), zero, nullifier];
+        let last_z_out = vec![next_opcode.clone(), nullifier];
 
         let z_out = conditionally_select_vec(
             cs.namespace(|| "Choose between outputs of last opcode and others"),
             &last_z_out,
-            &[next_opcode, new_io_hash, rsa_sig_hash],
+            &[next_opcode, new_io_hash],
             &is_opcode_last_rsa,
         )?;
 

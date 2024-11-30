@@ -12,14 +12,14 @@ use neptune::{
 };
 
 pub struct PoseidonHasher<Scalar: PrimeFieldBits> {
-    constants: PoseidonConstants<Scalar, typenum::U4>,
+    constants: PoseidonConstants<Scalar, typenum::U12>,
     io_pattern: IOPattern,
 }
 
 impl<Scalar: PrimeFieldBits> PoseidonHasher<Scalar> {
     pub fn new(num_absorbs: u32) -> Self {
         Self {
-            constants: Sponge::<Scalar, typenum::U4>::api_constants(neptune::Strength::Standard),
+            constants: Sponge::<Scalar, typenum::U12>::api_constants(neptune::Strength::Standard),
             io_pattern: IOPattern(vec![SpongeOp::Absorb(num_absorbs), SpongeOp::Squeeze(1)]),
         }
     }

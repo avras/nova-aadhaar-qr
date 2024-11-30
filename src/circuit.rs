@@ -613,6 +613,19 @@ where
         let rsa_sig_power =
             BigNat::<Scalar>::from_limbs(rsa_sig_power_num_limbs, BIGNAT_LIMB_WIDTH);
 
+        let is_rsa_opcode_first_rsa_bit = Bit {
+            bit: is_rsa_opcode_first_rsa.lc(CS::one(), Scalar::ONE),
+            value: is_rsa_opcode_first_rsa.get_value(),
+        };
+
+        // Overwriting the rsa_sig_power allocated from auxiliary input with the signature in the first step
+        let rsa_sig_power = BigNat::<Scalar>::mux(
+            cs.namespace(|| "select between sig power and sig"),
+            &is_rsa_opcode_first_rsa_bit,
+            &rsa_sig_power,
+            &rsa_signature,
+        )?;
+
         let modulus_bigint = BigInt::from_bytes_be(Sign::Plus, &RSA_MODULUS_HEX_BYTES);
         let modulus_limb_values =
             nat_to_limbs::<Scalar>(&modulus_bigint, BIGNAT_LIMB_WIDTH, BIGNAT_NUM_LIMBS)?;

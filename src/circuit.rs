@@ -15,7 +15,7 @@ use sha2::{compress256, digest::generic_array::GenericArray};
 
 use crate::{
     dob::{
-        calculate_age_in_years, delimiter_count_before_dob_is_correct,
+        calculate_age_in_years, delimiter_count_before_and_within_dob_is_correct,
         get_day_month_year_conditional, left_shift_bytes, DOB_INDEX_BIT_LENGTH,
     },
     poseidon::PoseidonHasher,
@@ -446,7 +446,7 @@ where
         let mut two_sha256_msg_blocks = first_sha256_msg_block_booleans.clone();
         two_sha256_msg_blocks.extend(second_sha256_msg_block_booleans.clone().into_iter());
 
-        let delimiter_count_correct = delimiter_count_before_dob_is_correct(
+        let delimiter_count_correct = delimiter_count_before_and_within_dob_is_correct(
             cs.namespace(|| "check if delimiter count before DoB is correct"),
             &two_sha256_msg_blocks,
             &dob_byte_index,

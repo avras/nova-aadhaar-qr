@@ -4,6 +4,7 @@ use bellpepper_core::{
 use ff::{PrimeField, PrimeFieldBits};
 
 use crate::{
+    qr::DOB_LENGTH_BYTES,
     sha256::{SHA256_BLOCK_LENGTH_BITS, SHA256_BLOCK_LENGTH_BYTES},
     util::{
         alloc_constant, alloc_num_equals, alloc_num_equals_constant,
@@ -381,7 +382,7 @@ where
 // The delimiter byte in the Aadhaar QR code is 255.
 // The dob_byte_index is the zero-based index of the first
 // byte of the date of birth
-pub(crate) fn delimiter_count_before_dob_is_correct<Scalar, CS>(
+pub(crate) fn delimiter_count_before_and_within_dob_is_correct<Scalar, CS>(
     mut cs: CS,
     a: &[Boolean],
     dob_byte_index: &AllocatedNum<Scalar>,
@@ -395,6 +396,23 @@ where
         cs.namespace(|| "Check that DoB byte index fits in 7 bits"),
         &dob_byte_index,
         DOB_INDEX_BIT_LENGTH,
+    )?;
+
+    let dob_index_upper_bound = alloc_constant(
+        cs.namespace(|| "alloc max possible DoB index"),
+        Scalar::from((2 * SHA256_BLOCK_LENGTH_BYTES - DOB_LENGTH_BYTES) as u64),
+    )?;
+
+    let is_dob_in_first_block = less_than_or_equal(
+        cs.namespace(|| "DoB byte index <= 118"),
+        dob_byte_index,
+        &dob_index_upper_bound,
+        DOB_INDEX_BIT_LENGTH,
+    )?;
+    Boolean::enforce_equal(
+        cs.namespace(|| "DoB field must lie completely in first 128 bytes"),
+        &is_dob_in_first_block,
+        &Boolean::Constant(true),
     )?;
 
     let mut delimiter_byte_flags = vec![];
@@ -412,52 +430,122 @@ where
         delimiter_byte_flags.push(all_ones);
     }
 
-    let mut delim_count_lc = LinearCombination::<Scalar>::zero();
-    let mut delim_count_value: Option<Scalar> = Some(Scalar::ZERO);
+    let dob_length = alloc_constant(
+        cs.namespace(|| "DoB byte length - 1"),
+        Scalar::from((DOB_LENGTH_BYTES - 1) as u64),
+    )?;
+    let dob_end_byte_index = dob_byte_index.add(
+        cs.namespace(|| "Add DoB start byte index and DoB byte length"),
+        &dob_length,
+    )?;
+
+    let mut delim_count_before_dob_lc = LinearCombination::<Scalar>::zero();
+    let mut delim_count_within_dob_field_lc = LinearCombination::<Scalar>::zero();
+    let mut delim_count_before_dob_value: Option<Scalar> = Some(Scalar::ZERO);
+    let mut delim_count_within_dob_value: Option<Scalar> = Some(Scalar::ZERO);
     for i in 0..2 * SHA256_BLOCK_LENGTH_BYTES {
         let current_byte_index = AllocatedNum::alloc_infallible(
             cs.namespace(|| format!("alloc byte index {i}")),
             || Scalar::from(i as u64),
         );
-        let current_index_lt_dob_index = less_than(
+        let current_index_lt_dob_start_index = less_than(
             cs.namespace(|| format!("compare current index to DoB byte index {i}")),
             &current_byte_index,
             &dob_byte_index,
             DOB_INDEX_BIT_LENGTH,
         )?;
+        let current_index_lte_dob_end_index = less_than_or_equal(
+            cs.namespace(|| format!("current index <= DoB end byte index {i}")),
+            &current_byte_index,
+            &dob_end_byte_index,
+            DOB_INDEX_BIT_LENGTH,
+        )?;
+        let current_index_in_dob_span = Boolean::and(
+            cs.namespace(|| "current index is in the DoB field"),
+            &current_index_lt_dob_start_index.not(),
+            &current_index_lte_dob_end_index,
+        )?;
+
         let delimiter_before_dob = Boolean::and(
             cs.namespace(|| format!("delimiter before dob {i}")),
             &delimiter_byte_flags[i],
-            &current_index_lt_dob_index,
+            &current_index_lt_dob_start_index,
         )?;
-        delim_count_lc = delim_count_lc + &delimiter_before_dob.lc(CS::one(), Scalar::ONE);
-        delim_count_value = delim_count_value.map(|v| match delimiter_before_dob.get_value() {
-            Some(b) => {
-                if b {
-                    v + Scalar::ONE
-                } else {
-                    v
+        let delimiter_within_dob = Boolean::and(
+            cs.namespace(|| format!("delimiter in dob field {i}")),
+            &delimiter_byte_flags[i],
+            &current_index_in_dob_span,
+        )?;
+        delim_count_before_dob_lc =
+            delim_count_before_dob_lc + &delimiter_before_dob.lc(CS::one(), Scalar::ONE);
+        delim_count_within_dob_field_lc =
+            delim_count_within_dob_field_lc + &delimiter_within_dob.lc(CS::one(), Scalar::ONE);
+        delim_count_before_dob_value =
+            delim_count_before_dob_value.map(|v| match delimiter_before_dob.get_value() {
+                Some(b) => {
+                    if b {
+                        v + Scalar::ONE
+                    } else {
+                        v
+                    }
                 }
-            }
-            None => v,
-        });
+                None => v,
+            });
+        delim_count_within_dob_value =
+            delim_count_within_dob_value.map(|v| match delimiter_within_dob.get_value() {
+                Some(b) => {
+                    if b {
+                        v + Scalar::ONE
+                    } else {
+                        v
+                    }
+                }
+                None => v,
+            });
     }
 
-    let delim_count_num = AllocatedNum::alloc(cs.namespace(|| "alloc delimiter count"), || {
-        delim_count_value.ok_or_else(|| SynthesisError::AssignmentMissing)
-    })?;
+    // Check that there are no delimiters within the DoB field
+    let delim_count_within_dob_num =
+        AllocatedNum::alloc(cs.namespace(|| "alloc delimiter count within DoB"), || {
+            delim_count_within_dob_value.ok_or_else(|| SynthesisError::AssignmentMissing)
+        })?;
+
+    cs.enforce(
+        || "check DoB field has no delimiters",
+        |lc| lc + delim_count_within_dob_num.get_variable(),
+        |lc| lc + CS::one(),
+        |lc| lc + &delim_count_within_dob_field_lc,
+    );
+
+    let res1 = alloc_num_equals_constant(
+        cs.namespace(|| "Check that the number of delimiters within DoB is zero"),
+        &delim_count_within_dob_num,
+        Scalar::ZERO,
+    )?;
+
+    // Check that the number of delimiters before the DoB start is 4
+    let delim_count_before_dob_num =
+        AllocatedNum::alloc(cs.namespace(|| "alloc delimiter count"), || {
+            delim_count_before_dob_value.ok_or_else(|| SynthesisError::AssignmentMissing)
+        })?;
 
     cs.enforce(
         || "check that LC and allocated num match",
-        |lc| lc + delim_count_num.get_variable(),
+        |lc| lc + delim_count_before_dob_num.get_variable(),
         |lc| lc + CS::one(),
-        |lc| lc + &delim_count_lc,
+        |lc| lc + &delim_count_before_dob_lc,
     );
 
-    let res = alloc_num_equals_constant(
+    let res2 = alloc_num_equals_constant(
         cs.namespace(|| "Check that the number of delimiters before DoB is 4"),
-        &delim_count_num,
+        &delim_count_before_dob_num,
         Scalar::from(NUM_DELIMITERS_BEFORE_DOB as u64),
+    )?;
+
+    let res = Boolean::and(
+        cs.namespace(|| "No delimiters in DoB field AND four delimiters before it"),
+        &res1,
+        &res2,
     )?;
 
     Ok(res)

@@ -25,8 +25,8 @@ use crate::{
         RSA_MODULUS_LENGTH_BYTES,
     },
     sha256::{
-        sha256_digest_to_scalars, sha256_msg_block_sequence, sha256_state_to_bytes,
-        SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
+        sha256_digest_to_scalars, sha256_initial_digest_scalars, sha256_msg_block_sequence,
+        sha256_state_to_bytes, SHA256_BLOCK_LENGTH_BYTES, SHA256_DIGEST_LENGTH_BYTES, SHA256_IV,
     },
     util::{
         alloc_constant, alloc_num_equals, alloc_num_equals_constant, bignat_to_allocatednum_limbs,
@@ -348,6 +348,25 @@ where
                 )
             })
             .collect::<Result<Vec<_>, SynthesisError>>()?;
+        let initial_sha256_digest_scalars = sha256_initial_digest_scalars()
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                AllocatedNum::alloc(
+                    cs.namespace(|| format!("alloc SHA256 initial digest scalar {i}")),
+                    || Ok(s),
+                )
+            })
+            .collect::<Result<Vec<_>, SynthesisError>>()?;
+
+        // Overwrite current SHA256 digest scalars in the first step
+        let current_sha256_digest_scalars = conditionally_select_vec(
+            cs.namespace(|| "in first step use initial digest scalars"),
+            &initial_sha256_digest_scalars,
+            &current_sha256_digest_scalars,
+            &is_rsa_opcode_first_rsa,
+        )?;
+
         let prev_nullifier =
             AllocatedNum::alloc_infallible(cs.namespace(|| "alloc previous nullifier"), || {
                 self.prev_nullifier

@@ -2,6 +2,10 @@
 
 **TLDR:** [Anon Aadhaar](https://pse.dev/en/projects/anon-aadhaar) using [Nova](https://github.com/microsoft/Nova) instead of Groth16. This substitution reduces memory and download requirements.
 
+> [!WARNING]
+> This code has not been audited. Use with care.
+
+
 ## What is an Aadhaar QR code?
  An Aadhaar QR code is a QR code containing digitally signed data about an Aadhaar holder. It can be found on the back of an Aadhaar card. It can also be downloaded using the mAadhaar app (<a href="https://play.google.com/store/apps/details?id=in.gov.uidai.mAadhaarPlus" target="_blank">Google Play</a>, <a href="https://apps.apple.com/in/app/maadhaar/id1435469474" target="_blank">App Store</a>).  It contains the following information about the holder.
     
@@ -19,7 +23,7 @@ Additionally, it contains a timestamp indicating the date and time at which the 
 You will need an Aadhaar QR code image file to run the `proveage` example. Give the filename as the first argument and the current date in DD-MM-YYYY as the second argument.
 
 ```
-cargo run -r --example proveage qr.jpeg 30-11-2024
+$ cargo run -r --example proveage qr.jpeg 30-11-2024
     Finished `release` profile [optimized] target(s) in 0.07s
      Running `target/release/examples/proveage qr2.jpeg 30-11-2024`
 Producing public parameters...
@@ -63,6 +67,35 @@ Total verification time: 236.126807ms
 Nullifier = 0x3ee1abd50fd64c25d033406023341d7c0ac351eebf9a56f8fe0379de1a8288ff
 ```
 
+## Memory consumption
+Running the example using the `time -v` command gives a peak memory usage of about 350 MB.
+
+```
+$ command time -v ./target/release/examples/proveage qr.jpeg 30-11-2024
+    Command being timed: "./target/release/examples/proveage qr2.jpeg 30-11-2024"
+    User time (seconds): 82.31
+    System time (seconds): 0.55
+    Percent of CPU this job got: 518%
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:15.96
+    Average shared text size (kbytes): 0
+    Average unshared data size (kbytes): 0
+    Average stack size (kbytes): 0
+    Average total size (kbytes): 0
+    Maximum resident set size (kbytes): 346716
+    Average resident set size (kbytes): 0
+    Major (requiring I/O) page faults: 0
+    Minor (reclaiming a frame) page faults: 135390
+    Voluntary context switches: 9727
+    Involuntary context switches: 30133
+    Swaps: 0
+    File system inputs: 0
+    File system outputs: 0
+    Socket messages sent: 0
+    Socket messages received: 0
+    Signals delivered: 0
+    Page size (bytes): 4096
+    Exit status: 0
+```
 ## License
 
 Licensed under either of
